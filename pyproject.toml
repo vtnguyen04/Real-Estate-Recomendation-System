@@ -5,9 +5,12 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "implicit>=0.7.3",
     "numpy>=2.4.4",
     "polars>=1.40.1",
     "pydantic>=2.13.4",
+    "scikit-learn>=1.8.0",
+    "scipy>=1.17.1",
 ]
 
 [dependency-groups]
