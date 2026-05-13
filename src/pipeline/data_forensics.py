@@ -22,7 +22,7 @@ class FutureLeakageGuard(BaseRule):
     def apply(self, items: pl.LazyFrame, context: RecommendationContext = None) -> pl.LazyFrame:
         schema = items.collect_schema().names()
         if "date" in schema:
-            return items.filter(pl.col('date') <= self.cutoff_date)
+            return items.filter(pl.col('date').cast(pl.String) <= self.cutoff_date)
         return items
 
 
