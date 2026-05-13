@@ -7,11 +7,12 @@ from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Optional
 import polars as pl
 from pydantic import BaseModel, Field
+from datetime import datetime
 
 class RecommendationContext(BaseModel):
     """Context for recommendation request"""
     user_id: str
-    timestamp: str  # Could also use datetime if parsing is desired
+    timestamp: Optional[str] = Field(default_factory=lambda: datetime.now().isoformat())
     num_recommendations: int = Field(default=10, gt=0)
     filters: Optional[Dict[str, Any]] = None
     metadata: Optional[Dict[str, Any]] = None
@@ -53,16 +54,16 @@ class BaseRecommender(ABC):
         self,
         context: RecommendationContext,
         candidates: Optional[pl.LazyFrame] = None
-    ) -> List[Recommendation]:
+    ) -> pl.LazyFrame:
         """
-        Generate recommendations
+        Generate recommendations / score candidates.
 
         Args:
             context: User and request context
-            candidates: Optional pre-filtered candidates to score
+            candidates: Optional pre-filtered candidates to score (for rankers)
 
         Returns:
-            List of recommendations sorted by score
+            LazyFrame with columns [user_id, item_id, score] sorted by score
         """
         pass
 

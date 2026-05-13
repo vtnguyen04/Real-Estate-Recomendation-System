@@ -56,8 +56,7 @@ class FeatureEngineer:
             df = df.join(view_history, on=["user_id", "item_id"], how="left")
             df = df.with_columns(pl.col("user_viewed_this_item").fill_null(0))
             
-            # Session Price Rank
-            # (Rank of this item's price compared to everything else user viewed in current session)
+            # Session Price Ratio
             if "price_vnd" in schema and "session_id" in interactions.collect_schema().names():
                 session_prices = interactions.join(item_profile.select(['item_id', 'price_vnd']), on='item_id', how='inner')
                 session_stats = session_prices.group_by("user_id").agg([
@@ -67,6 +66,15 @@ class FeatureEngineer:
                 df = df.with_columns([
                     (pl.col("price_vnd") / (pl.col("session_avg_price") + 1.0)).alias("session_price_ratio")
                 ])
+                
+        # 3.5 Market Value Aggregates (for ValueScoreRule)
+        if "price_vnd" in schema and "category" in schema and "district_name" in schema:
+            market_stats = item_profile.group_by(["category", "district_name"]).agg([
+                pl.col("price_vnd").median().alias("market_avg_price")
+            ])
+            df = df.join(market_stats, on=["category", "district_name"], how="left")
+            # Rename price_vnd to price for ValueScoreRule consistency or vice versa
+            df = df.with_columns(pl.col("price_vnd").alias("price"))
                 
         # 4. Apply Deterministic Scoring Rules (Geo, Urgency, Quality, Match)
         # Sort by priority just in case rules have dependencies
