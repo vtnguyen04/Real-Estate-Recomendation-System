@@ -26,10 +26,9 @@ def test_als_recommender():
     ctx_u1 = RecommendationContext(user_id="u1", timestamp="2026-04-01", num_recommendations=1)
     recs_u1 = model.recommend(ctx_u1)
     
-    assert len(recs_u1) == 1
+    assert recs_u1.collect().height == 1
     # CF should recommend i3, because u1 already liked i1 (which is filtered out)
-    assert recs_u1[0].item_id == "i3"
-    assert recs_u1[0].explanation == "Personalized collaborative filtering (ALS)"
+    assert recs_u1.collect()[0, "item_id"] == "i3"
     
     # 2. Pure Cold-Start User Test
     ctx_u_cold = RecommendationContext(user_id="u_cold", timestamp="2026-04-01", num_recommendations=5)
@@ -37,4 +36,4 @@ def test_als_recommender():
     
     # ALS natively returns empty array for completely unseen users
     # This proves we need the HybridOrchestrator to fallback to PopularityRecommender
-    assert len(recs_cold) == 0
+    assert recs_cold.collect().height == 0

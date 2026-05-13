@@ -18,6 +18,9 @@ class PopularityRecommender(BaseRecommender):
         Args:
             train_data: A LazyFrame representing item snapshots (e.g., fact_listing_snapshot)
         """
+        if isinstance(train_data, pl.DataFrame):
+            train_data = train_data.lazy()
+            
         schema = train_data.collect_schema().names()
         if "item_id" not in schema:
             return self

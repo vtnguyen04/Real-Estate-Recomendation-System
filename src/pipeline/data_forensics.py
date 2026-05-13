@@ -6,6 +6,7 @@ Implements the exact business heuristics discovered in the Datathon 2026 strateg
 import polars as pl
 from datetime import timedelta
 import numpy as np
+from typing import List
 from src.core.base import BaseRule, RecommendationContext
 
 class FutureLeakageGuard(BaseRule):
@@ -196,7 +197,7 @@ class DataForensicsPipeline:
     Orchestrates the execution of all forensic rules sequentially.
     Sorted by priority to ensure heavy filters (Leakage, Bots) run before complex aggregations.
     """
-    def __init__(self, rules: list[BaseRule] = None):
+    def __init__(self, rules: List[BaseRule] = None):
         if rules is None:
             self.rules = sorted([
                 FutureLeakageGuard(),

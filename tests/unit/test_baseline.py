@@ -16,11 +16,9 @@ def test_popularity_recommender():
     ctx = RecommendationContext(user_id="u_cold_start", timestamp="2026-04-09", num_recommendations=2)
     recs = model.recommend(ctx)
     
-    assert len(recs) == 2
+    assert recs.collect().height == 2
     # i2 has the highest score
-    assert recs[0].item_id == "i2"
-    assert recs[0].rank == 1
+    assert recs.collect()[0, "item_id"] == "i2"
     
     # i1 is second
-    assert recs[1].item_id == "i1"
-    assert recs[1].rank == 2
+    assert recs.collect()[1, "item_id"] == "i1"

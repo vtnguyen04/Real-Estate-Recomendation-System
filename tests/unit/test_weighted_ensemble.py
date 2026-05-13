@@ -12,11 +12,11 @@ class MockALS(BaseRecommender):
     
     def recommend(self, context, candidates=None):
         if context.user_id == "u_cold":
-            return []  # Cold-Start returns nothing
-        return [
-            Recommendation(item_id="i1", score=10.0, rank=1, explanation="ALS"),
-            Recommendation(item_id="i2", score=5.0, rank=2, explanation="ALS"),
-        ]
+            return pl.LazyFrame(schema={'user_id': pl.Utf8, 'item_id': pl.Utf8, 'score': pl.Float64})
+        return pl.LazyFrame([
+            {"user_id": context.user_id, "item_id": "i1", "score": 10.0},
+            {"user_id": context.user_id, "item_id": "i2", "score": 5.0}
+        ])
         
     def save(self, path): pass
     def load(self, path): return self
@@ -28,10 +28,10 @@ class MockPop(BaseRecommender):
     def fit(self, train_data, **kwargs): return self
     
     def recommend(self, context, candidates=None):
-        return [
-            Recommendation(item_id="i3", score=100.0, rank=1, explanation="Pop"),
-            Recommendation(item_id="i2", score=50.0, rank=2, explanation="Pop"),
-        ]
+        return pl.LazyFrame([
+            {"user_id": context.user_id, "item_id": "i3", "score": 100.0},
+            {"user_id": context.user_id, "item_id": "i2", "score": 50.0}
+        ])
         
     def save(self, path): pass
     def load(self, path): return self
@@ -57,10 +57,10 @@ def test_weighted_ensemble_warm_user():
     # i3 = 0.7 * 0.0 + 0.3 * 1.0 = 0.3
     # i2 = 0.7 * 0.0 + 0.3 * 0.0 = 0.0
     
-    assert len(recs) == 3
-    assert recs[0].item_id == "i1"
-    assert recs[1].item_id == "i3"
-    assert recs[2].item_id == "i2"
+    assert recs.collect().height == 3
+    assert recs.collect()[0, "item_id"] == "i1"
+    assert recs.collect()[1, "item_id"] == "i3"
+    assert recs.collect()[2, "item_id"] == "i2"
 
 def test_weighted_ensemble_cold_start_fallback():
     """Ensure ensemble correctly falls back to Popularity if ALS returns empty."""
@@ -78,7 +78,6 @@ def test_weighted_ensemble_cold_start_fallback():
     # ALS returns []
     # Pop returns [i3, i2]
     # Fallback inherently kicks in, filling the void
-    assert len(recs) == 2
-    assert recs[0].item_id == "i3"
-    assert recs[1].item_id == "i2"
-    assert "mock_pop" in recs[0].explanation
+    assert recs.collect().height == 2
+    assert recs.collect()[0, "item_id"] == "i3"
+    assert recs.collect()[1, "item_id"] == "i2"

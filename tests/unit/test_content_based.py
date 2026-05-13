@@ -23,11 +23,10 @@ def test_content_recommender():
     recs = model.recommend(ctx)
     
     # Assert CF returns results
-    assert len(recs) == 1
+    assert recs.collect().height == 1
     # i1 is in history, so it must be suppressed (-1.0).
     # i3 shares 'Luxury', 'City', 'Center' -> High Cosine Similarity vs i2
-    assert recs[0].item_id == "i3"
-    assert recs[0].explanation == "Content similarity (TF-IDF)"
+    assert recs.collect()[0, "item_id"] == "i3"
 
 def test_content_recommender_cold_start():
     items = pl.LazyFrame([
@@ -44,4 +43,4 @@ def test_content_recommender_cold_start():
     recs = model.recommend(ctx)
     
     # Expect empty fallback trigger
-    assert len(recs) == 0
+    assert recs.collect().height == 0
