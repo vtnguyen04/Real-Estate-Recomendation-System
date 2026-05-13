@@ -56,15 +56,15 @@ class ALSRecommender(BaseRecommender):
         self,
         context: RecommendationContext,
         candidates: Optional[pl.LazyFrame] = None
-    ) -> List[Recommendation]:
+    ) -> pl.LazyFrame:
         
         if not self.matrix_builder:
-            return []
+            return pl.DataFrame([]).lazy()
             
         user_idx = self.matrix_builder.get_user_idx(context.user_id)
         if user_idx == -1:
             # User not in training set -> Pure Cold Start
-            return []
+            return pl.DataFrame([]).lazy()
             
         # Get top K recommendations for the user
         ids, scores = self.model.recommend(
@@ -74,15 +74,15 @@ class ALSRecommender(BaseRecommender):
             filter_already_liked_items=True
         )
         
-        recs = []
-        for i, (item_idx, score) in enumerate(zip(ids, scores)):
-            recs.append(Recommendation(
-                item_id=self.matrix_builder.get_item_id(item_idx),
-                score=float(score),
-                rank=i + 1,
-                explanation="Personalized collaborative filtering (ALS)"
-            ))
-        return recs
+        recs = [
+            {
+                "user_id": context.user_id,
+                "item_id": self.matrix_builder.get_item_id(item_idx),
+                "score": float(score)
+            }
+            for item_idx, score in zip(ids, scores)
+        ]
+        return pl.DataFrame(recs).lazy()
 
     def save(self, path: str) -> None:
         self.model.save(path)

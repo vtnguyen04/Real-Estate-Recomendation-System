@@ -45,19 +45,17 @@ class PopularityRecommender(BaseRecommender):
         self,
         context: RecommendationContext,
         candidates: Optional[pl.LazyFrame] = None
-    ) -> List[Recommendation]:
+    ) -> pl.LazyFrame:
         
-        k = min(context.num_recommendations, len(self.popular_items))
+        k = context.num_recommendations
         
-        recs = []
-        for i, (item_id, score) in enumerate(self.popular_items[:k]):
-            recs.append(Recommendation(
-                item_id=item_id,
-                score=float(score),
-                rank=i + 1,
-                explanation="Trending globally in the last 24h"
-            ))
-        return recs
+        # self.popular_items is list of (item_id, score)
+        recs = [
+            {"user_id": context.user_id, "item_id": item_id, "score": float(score)}
+            for item_id, score in self.popular_items[:k]
+        ]
+        
+        return pl.DataFrame(recs).lazy()
 
     def save(self, path: str) -> None:
         import json

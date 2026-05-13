@@ -65,15 +65,15 @@ class ContentRecommender(BaseRecommender):
         self,
         context: RecommendationContext,
         candidates: Optional[pl.LazyFrame] = None
-    ) -> List[Recommendation]:
+    ) -> pl.LazyFrame:
         
         if not self.item_ids or self.tfidf_matrix is None:
-            return []
+            return pl.DataFrame([]).lazy()
             
         user_idx_history = self.user_history.get(context.user_id, [])
         if not user_idx_history:
             # Pure Cold-Start
-            return []
+            return pl.DataFrame([]).lazy()
             
         # Create user profile vector by averaging TF-IDF vectors of historically viewed items
         user_vector = self.tfidf_matrix[user_idx_history].mean(axis=0)
@@ -90,18 +90,15 @@ class ContentRecommender(BaseRecommender):
         # Sort them in descending order
         top_indices = top_indices[np.argsort(sim_scores[top_indices])[::-1]]
         
-        recs = []
-        for rank, idx in enumerate(top_indices):
-            score = sim_scores[idx]
-            if score > 0:
-                recs.append(Recommendation(
-                    item_id=self.item_ids[idx],
-                    score=float(score),
-                    rank=rank + 1,
-                    explanation="Content similarity (TF-IDF)"
-                ))
-                
-        return recs
+        recs = [
+            {
+                "user_id": context.user_id,
+                "item_id": self.item_ids[idx],
+                "score": float(sim_scores[idx])
+            }
+            for idx in top_indices if sim_scores[idx] > 0
+        ]
+        return pl.DataFrame(recs).lazy()
 
     def save(self, path: str) -> None:
         import pickle
