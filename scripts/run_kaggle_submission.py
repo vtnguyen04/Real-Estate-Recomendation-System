@@ -1,9 +1,11 @@
 import os
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import argparse
 import polars as pl
 import pyarrow.dataset as ds
 from src.utils.logging import get_logger
-from src.pipeline.data_forensics import DataForensics
+from src.pipeline.data_forensics import DataForensicsPipeline
 from src.features.feature_engineer import FeatureEngineer
 from src.rules.geo_rules import GeoProximityScoreRule
 from src.rules.quality_rules import QualityScoreRule
@@ -48,7 +50,7 @@ def main(bucket_name="datathon_2026_final"):
         })
 
     logger.info("Step 2: Data Forensics")
-    forensics = DataForensics()
+    forensics = DataForensicsPipeline()
     # clean_events = forensics.apply_filters(raw_events)
 
     logger.info("Step 3: Feature Engineering & Rules")
