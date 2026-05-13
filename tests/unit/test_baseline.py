@@ -1,5 +1,5 @@
 import polars as pl
-from src.models.baseline import PopularityRecommender
+from src.models.baselines.popularity import PopularityRecommender
 from src.core.base import RecommendationContext
 
 def test_popularity_recommender():

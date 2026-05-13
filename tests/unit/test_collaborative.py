@@ -1,7 +1,7 @@
 import pytest
 import polars as pl
 from datetime import datetime
-from src.models.collaborative import ALSRecommender
+from src.models.candidates.als_recommender import ALSRecommender
 from src.core.base import RecommendationContext
 
 def test_als_recommender():
