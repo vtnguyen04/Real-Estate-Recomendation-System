@@ -34,8 +34,11 @@ class FeatureEngineer:
         """
         
         # 1. Base Joins
-        df = candidate_items.join(user_profile, on="user_id", how="left")
-        df = df.join(item_profile, on="item_id", how="left")
+        df = candidate_items
+        if user_profile is not None:
+            df = df.join(user_profile, on="user_id", how="left")
+        if item_profile is not None:
+            df = df.join(item_profile, on="item_id", how="left")
         
         # 2. Extract Cross-Features & Derived Signals
         schema = df.collect_schema().names()

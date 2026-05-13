@@ -88,5 +88,5 @@ class ALSRecommender(BaseRecommender):
         self.model.save(path)
 
     def load(self, path: str) -> 'BaseRecommender':
-        self.model = implicit.als.AlternatingLeastSquares.load(path)
+        self.model = implicit.cpu.als.AlternatingLeastSquares.load(path)
         return self

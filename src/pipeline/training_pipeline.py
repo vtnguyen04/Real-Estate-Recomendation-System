@@ -2,10 +2,10 @@ import polars as pl
 from typing import Dict, Any, Optional
 import os
 
-from src.core.base import BasePipeline, RecommendationContext, RecommendationResult
+from src.core.base import RecommendationContext
 from src.evaluation.cross_validator import TimeBasedSplitter
 from src.features.feature_engineer import FeatureEngineer
-from src.pipeline.data_forensics import DataForensics
+from src.pipeline.data_forensics import DataForensicsPipeline
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -31,7 +31,7 @@ class TrainingPipeline:
         self.ranker = ranker
         self.config = config or {}
         
-        self.forensics = DataForensics()
+        self.forensics = DataForensicsPipeline()
         self.splitter = TimeBasedSplitter(
             validation_days=self.config.get("validation_days", 3),
             timestamp_col="timestamp"
@@ -52,7 +52,7 @@ class TrainingPipeline:
 
         # 1. Data Forensics (Clean raw data)
         logger.info("Step 1: Applying Data Forensics...")
-        clean_events = self.forensics.apply_filters(raw_events)
+        clean_events = self.forensics.clean(raw_events)
 
         # 2. Temporal Train/Val Split
         logger.info("Step 2: Performing Time-Based Split...")
@@ -71,21 +71,31 @@ class TrainingPipeline:
         # For a ranker, we need positive examples (interacted) and negative examples.
         # For simplicity in this orchestrator, we assume the feature_engineer 
         # or the ranker itself handles negative sampling if not provided.
-        train_features = self.feature_engineer.transform(
-            interactions=train_events,
-            item_profile=item_profile
+        # Assume labels are generated or already present in train_events
+        # Ensure label_binary and label_multiclass are carried over
+        cols_to_select = ['user_id', 'item_id']
+        for col in ['label_binary', 'label_multiclass', 'group_id']:
+            if col in train_events.collect_schema().names():
+                cols_to_select.append(col)
+
+        train_features = self.feature_engineer.engineer_features(
+            candidate_items=train_events.select(cols_to_select).unique(),
+            user_profile=None,
+            item_profile=item_profile,
+            interactions=train_events
         )
 
-        val_features = self.feature_engineer.transform(
-            interactions=val_events,
-            item_profile=item_profile
+        val_features = self.feature_engineer.engineer_features(
+            candidate_items=val_events.select(cols_to_select).unique(),
+            user_profile=None,
+            item_profile=item_profile,
+            interactions=val_events
         )
 
         # 5. Train Ranker (Stage 3)
         logger.info("Step 5: Training ML Ranker...")
         self.ranker.fit(
-            train_data=train_features,
-            val_data=val_features
+            train_data=train_features
         )
         
         logger.info("Training Pipeline Completed Successfully.")
