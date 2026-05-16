@@ -92,34 +92,22 @@ class BaseDataLoader(ABC):
         pass
 
 
-class GCSDataLoader(BaseDataLoader):
+class ParquetDataLoader(BaseDataLoader):
     """
-    GCS loader using PyArrow and Polars scan for zero-copy, lazy evaluation.
+    Parquet loader using PyArrow and Polars scan for zero-copy, lazy evaluation.
     """
 
     def __init__(
         self,
-        gcs_path: str,
+        data_path: str,
         table_name: str,
-        project_id: str,
+        project_id: str = None,
         **kwargs
     ):
         super().__init__(name=table_name, **kwargs)
-        self.gcs_path = gcs_path
+        self.data_path = data_path
         self.table_name = table_name
         self.project_id = project_id
-
-        # Initialize GCS authentication
-        self._authenticate()
-
-    def _authenticate(self):
-        """Authenticate with Google Cloud"""
-        try:
-            from google.colab import auth
-            auth.authenticate_user()
-            logger.info("Successfully authenticated with Google Cloud")
-        except ImportError:
-            logger.warning("Not in Colab environment. Assuming local ADC credentials.")
 
     def _load_impl(
         self,
@@ -127,10 +115,10 @@ class GCSDataLoader(BaseDataLoader):
         filters: Optional[dict]
     ) -> pl.LazyFrame:
         """Load from GCS using PyArrow and Polars scan"""
-        logger.info(f"Scanning {self.table_name} from {self.gcs_path}")
+        logger.info(f"Scanning {self.table_name} from {self.data_path}")
 
         # Load dataset metadata with PyArrow
-        dataset = ds.dataset(self.gcs_path, format='parquet')
+        dataset = ds.dataset(self.data_path, format='parquet')
 
         # Convert to Polars LazyFrame (zero copy, lazy evaluation)
         lf = pl.scan_pyarrow_dataset(dataset)
@@ -164,7 +152,7 @@ class GCSDataLoader(BaseDataLoader):
         Yields:
             LazyFrames
         """
-        dataset = ds.dataset(self.gcs_path, format='parquet')
+        dataset = ds.dataset(self.data_path, format='parquet')
         files = dataset.files
 
         logger.info(f"Total files: {len(files)}")
@@ -191,6 +179,6 @@ class GCSDataLoader(BaseDataLoader):
 
     def get_schema(self) -> dict:
         return {
-            "type": "gcs_parquet",
-            "path": self.gcs_path
+            "type": "local_parquet",
+            "path": self.data_path
         }

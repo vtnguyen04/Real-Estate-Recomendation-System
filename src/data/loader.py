@@ -4,12 +4,12 @@ Handles loading `dim_listing` and `fact_user_events`.
 """
 import polars as pl
 from typing import Optional, List, Dict, Any
-from src.data.loaders.base_loader import GCSDataLoader
+from src.data.loaders.base_loader import ParquetDataLoader
 
-class ListingDataLoader(GCSDataLoader):
+class ListingDataLoader(ParquetDataLoader):
     """Loader for dim_listing"""
-    def __init__(self, project_id: str, gcs_path: str = "gs://datathon_2026_final/train/dim_listing/"):
-        super().__init__(gcs_path=gcs_path, table_name="dim_listing", project_id=project_id)
+    def __init__(self, project_id: str = None, data_path: str = "data/raw/train/dim_listing/"):
+        super().__init__(data_path=data_path, table_name="dim_listing", project_id=project_id)
 
     def get_schema(self) -> dict:
         return {
@@ -21,10 +21,10 @@ class ListingDataLoader(GCSDataLoader):
             'price_bucket': str, 'images_count': float, 'posted_date': str, 'expected_expired_date': str
         }
 
-class ListingSnapshotLoader(GCSDataLoader):
+class ListingSnapshotLoader(ParquetDataLoader):
     """Loader for fact_listing_snapshot"""
-    def __init__(self, project_id: str, gcs_path: str = "gs://datathon_2026_final/train/fact_listing_snapshot/"):
-        super().__init__(gcs_path=gcs_path, table_name="fact_listing_snapshot", project_id=project_id)
+    def __init__(self, project_id: str = None, data_path: str = "data/raw/train/fact_listing_snapshot/"):
+        super().__init__(data_path=data_path, table_name="fact_listing_snapshot", project_id=project_id)
 
     def get_schema(self) -> dict:
         return {
@@ -32,10 +32,10 @@ class ListingSnapshotLoader(GCSDataLoader):
             'contacts_24h': float, 'listing_age_days': float
         }
 
-class PostContactInteractionsLoader(GCSDataLoader):
+class PostContactInteractionsLoader(ParquetDataLoader):
     """Loader for fact_post_contact_interactions"""
-    def __init__(self, project_id: str, gcs_path: str = "gs://datathon_2026_final/train/fact_post_contact_interactions/"):
-        super().__init__(gcs_path=gcs_path, table_name="fact_post_contact_interactions", project_id=project_id)
+    def __init__(self, project_id: str = None, data_path: str = "data/raw/train/fact_post_contact_interactions/"):
+        super().__init__(data_path=data_path, table_name="fact_post_contact_interactions", project_id=project_id)
 
     def get_schema(self) -> dict:
         return {
@@ -44,10 +44,10 @@ class PostContactInteractionsLoader(GCSDataLoader):
             'chat_lead': float, 'purchased': bool, 'category': int
         }
 
-class FactUserEventsLoader(GCSDataLoader):
+class FactUserEventsLoader(ParquetDataLoader):
     """Loader for fact_user_events"""
-    def __init__(self, project_id: str, gcs_path: str = "gs://datathon_2026_final/train/fact_user_events/"):
-        super().__init__(gcs_path=gcs_path, table_name="fact_user_events", project_id=project_id)
+    def __init__(self, project_id: str = None, data_path: str = "data/raw/train/fact_user_events/"):
+        super().__init__(data_path=data_path, table_name="fact_user_events", project_id=project_id)
 
     def _load_impl(self, columns: Optional[List[str]], filters: Optional[dict]) -> pl.LazyFrame:
         lf = super()._load_impl(columns, filters)

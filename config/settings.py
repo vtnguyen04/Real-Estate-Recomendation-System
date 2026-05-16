@@ -10,8 +10,8 @@ from typing import Dict, List, Optional
 class DataConfig:
     """Configuration for data ingestion and processing."""
     bucket_name: str = "datathon_2026_final"
-    train_path: str = "gs://datathon_2026_final/train/"
-    test_path: str = "gs://datathon_2026_final/test/"
+    train_path: str = "data/raw/train/"
+    test_path: str = "data/raw/test/"
     cutoff_date: str = "2026-04-09"
     positive_events: List[str] = field(
         default_factory=lambda: ["view_phone", "contact_chat", "contact_zalo", "contact_sms"]
