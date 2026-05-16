@@ -11,6 +11,18 @@ from config.paths import SUBMISSIONS_DIR
 from src.pipeline.inference_pipeline import InferencePipeline
 from src.core.base import RecommendationContext
 
+from src.models.candidates.als_recommender import ALSRecommender
+from src.models.baselines.popularity import PopularityRecommender
+from src.models.ensemble.weighted_ensemble import WeightedEnsembleRecommender
+from src.features.feature_engineer import FeatureEngineer
+from src.rules.geo_rules import GeoProximityScoreRule
+from src.rules.quality_rules import QualityScoreRule
+from src.rules.urgency_rules import UrgencyScoreRule
+from src.rules.match_rules import MatchScoreRule
+from src.rules.value_rules import ValueScoreRule
+from src.models.rankers.lgbm_ranker import MultiTaskLGBMRanker
+from src.models.rerankers.multi_objective import MultiObjectiveReranker
+
 logger = get_logger(__name__)
 
 
@@ -22,8 +34,24 @@ def main(output_file: str = "submission.csv", test_users_file: str = None):
 
     config = PipelineConfig()
 
+    logger.info("Setting up Components...")
+    als = ALSRecommender(factors=64)
+    pop = PopularityRecommender()
+    ensemble_cg = WeightedEnsembleRecommender(models=[als, pop], weights=[0.9, 0.1])
+
+    rules = [GeoProximityScoreRule(), QualityScoreRule(), UrgencyScoreRule(), MatchScoreRule(), ValueScoreRule()]
+    fe = FeatureEngineer(deterministic_rules=rules)
+    ranker = MultiTaskLGBMRanker()
+    reranker = MultiObjectiveReranker(alpha=0.65, beta=0.15, gamma=0.15, delta=0.05)
+
     # Initialize the inference pipeline
-    pipeline = InferencePipeline()
+    pipeline = InferencePipeline(
+        candidate_generator=ensemble_cg,
+        feature_engineer=fe,
+        ranker=ranker,
+        reranker=reranker,
+        config={"top_k": config.top_k}
+    )
 
     logger.info("Loading test users...")
     
