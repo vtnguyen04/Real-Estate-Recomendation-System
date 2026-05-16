@@ -33,6 +33,11 @@ def test_als_recommender_fit_predict(tmp_path):
     res_cold = recommender.recommend(context_cold).collect()
     assert res_cold.height == 0
     
+    # test unfit model
+    recommender_unfit = ALSRecommender()
+    res_unfit = recommender_unfit.recommend(context).collect()
+    assert res_unfit.height == 0
+    
     # save / load
     save_path = str(tmp_path / "als_model.npz")
     recommender.save(save_path)

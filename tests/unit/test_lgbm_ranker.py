@@ -40,6 +40,14 @@ def test_lgbm_ranker_fit_predict(tmp_path):
     assert "score" in res_df.columns
     assert res_df.height == 2
     
+    # Test None candidates
+    res_none = ranker.recommend(context, None).collect()
+    assert res_none.height == 0
+    
+    # Test empty candidates
+    res_empty = ranker.recommend(context, pl.LazyFrame([])).collect()
+    assert res_empty.height == 0
+    
     # Test save/load
     ranker.save(str(tmp_path))
     

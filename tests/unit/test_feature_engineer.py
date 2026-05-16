@@ -25,13 +25,21 @@ def test_feature_engineer_aggregations():
     ])
     
     item_profile = pl.LazyFrame([
-        {"item_id": "i1", "price_vnd": 100.0},
-        {"item_id": "i2", "price_vnd": 200.0}
+        {"item_id": "i1", "price_vnd": 100.0, "category": 1, "district_name": "D1"},
+        {"item_id": "i2", "price_vnd": 200.0, "category": 1, "district_name": "D1"}
     ])
     
     # u1 viewed i1 in session s1
     interactions = pl.LazyFrame([
         {"user_id": "u1", "item_id": "i1", "session_id": "s1", "event_type": "pageview"}
+    ])
+    
+    session_embeddings = pl.LazyFrame([
+        {"user_id": "u1", "session_emb_0": 0.5}
+    ])
+    
+    graph_embeddings = pl.LazyFrame([
+        {"item_id": "i1", "graph_emb_0": 0.1}
     ])
     
     fe = FeatureEngineer(deterministic_rules=[MockRule()])
@@ -40,7 +48,9 @@ def test_feature_engineer_aggregations():
         candidate_items=candidate_items,
         user_profile=user_profile,
         item_profile=item_profile,
-        interactions=interactions
+        interactions=interactions,
+        session_embeddings=session_embeddings,
+        graph_embeddings=graph_embeddings
     ).collect()
     
     # 1. Rule Application

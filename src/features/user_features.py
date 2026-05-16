@@ -8,11 +8,8 @@ class UserBehaviorExtractor(BaseFeatureExtractor):
     def __init__(self, name: str = "user_behavior_extractor", **kwargs):
         super().__init__(name=name, **kwargs)
 
-    def _validate_input(self, data: pl.LazyFrame) -> None:
-        expected_cols = {'user_id', 'event_type', 'dwell_time_sec'}
-        # In a real setup, we might check data.columns if it was a DataFrame
-        # For LazyFrame, we assume the pipeline guarantees schema.
-        pass
+    def get_required_columns(self) -> list[str]:
+        return ['user_id', 'event_type', 'dwell_time_sec']
 
     def _compute_features(self, data: pl.LazyFrame) -> pl.LazyFrame:
         """

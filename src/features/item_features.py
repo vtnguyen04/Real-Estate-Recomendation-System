@@ -9,8 +9,8 @@ class ItemPopularityExtractor(BaseFeatureExtractor):
     def __init__(self, name: str = "item_popularity_extractor", **kwargs):
         super().__init__(name=name, **kwargs)
 
-    def _validate_input(self, data: pl.LazyFrame) -> None:
-        pass
+    def get_required_columns(self) -> list[str]:
+        return ['item_id']
 
     def _compute_features(self, data: pl.LazyFrame) -> pl.LazyFrame:
         """
