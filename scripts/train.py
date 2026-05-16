@@ -21,6 +21,8 @@ from src.rules.match_rules import MatchScoreRule
 from src.rules.value_rules import ValueScoreRule
 from src.models.rankers.lgbm_ranker import MultiTaskLGBMRanker
 from src.pipeline.training_pipeline import TrainingPipeline
+from src.models.deep.session_gru import SessionBasedRecommender
+from src.models.deep.graph_sage import GraphBasedRecommender
 
 logger = get_logger(__name__)
 
@@ -45,7 +47,13 @@ def main(config_path: str = None):
     logger.info("Setting up Components...")
     als = ALSRecommender(factors=64)
     pop = PopularityRecommender()
-    ensemble_cg = WeightedEnsembleRecommender(models=[als, pop], weights=[0.9, 0.1])
+    gru = SessionBasedRecommender()
+    graph = GraphBasedRecommender()
+    
+    ensemble_cg = WeightedEnsembleRecommender(
+        models=[als, gru, graph, pop], 
+        weights=[0.45, 0.25, 0.15, 0.15]
+    )
 
     rules = [GeoProximityScoreRule(), QualityScoreRule(), UrgencyScoreRule(), MatchScoreRule(), ValueScoreRule()]
     fe = FeatureEngineer(deterministic_rules=rules)
