@@ -3,12 +3,14 @@ import polars as pl
 from src.features.feature_engineer import FeatureEngineer
 from src.core.base import BaseRule, RecommendationContext
 
+from typing import Optional
+
 class MockRule(BaseRule):
     def __init__(self):
         super().__init__(name="mock_rule", is_hard_filter=False)
         self.priority = 10
         
-    def apply(self, items: pl.LazyFrame, context: RecommendationContext = None) -> pl.LazyFrame:
+    def apply(self, items: pl.LazyFrame, context: Optional[RecommendationContext] = None) -> pl.LazyFrame:
         return items.with_columns(pl.lit(99.0).alias("mock_score"))
 
 def test_feature_engineer_aggregations():
