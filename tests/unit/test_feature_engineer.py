@@ -8,8 +8,8 @@ class MockRule(BaseRule):
         super().__init__(name="mock_rule", is_hard_filter=False)
         self.priority = 10
         
-    def apply(self, df: pl.LazyFrame, context: RecommendationContext = None) -> pl.LazyFrame:
-        return df.with_columns(pl.lit(99.0).alias("mock_score"))
+    def apply(self, items: pl.LazyFrame, context: RecommendationContext = None) -> pl.LazyFrame:
+        return items.with_columns(pl.lit(99.0).alias("mock_score"))
 
 def test_feature_engineer_aggregations():
     """Ensure FeatureEngineer extracts cold-start, session ratios, and history checks."""

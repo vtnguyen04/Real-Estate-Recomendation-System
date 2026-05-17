@@ -32,11 +32,15 @@ def test_time_series_cross_validator():
     
     # Train should have dates < split_point
     assert len(train_df) == 2
-    assert train_df["timestamp"].max() < split_point
+    max_ts = train_df["timestamp"].max()
+    assert isinstance(max_ts, datetime)
+    assert max_ts < split_point
     
     # Val should have dates >= split_point
     assert len(val_df) == 3
-    assert val_df["timestamp"].min() >= split_point
+    min_ts = val_df["timestamp"].min()
+    assert isinstance(min_ts, datetime)
+    assert min_ts >= split_point
 
 from src.evaluation.health_metrics import HealthMetrics
 
