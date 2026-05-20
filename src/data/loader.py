@@ -62,3 +62,14 @@ class FactUserEventsLoader(ParquetDataLoader):
             'query': str, 'event_ts': str, 'surface': str, 'position': float,
             'device': str, 'dwell_time_sec': float, 'is_contact': int, 'date': str
         }
+
+class TestUsersLoader(ParquetDataLoader):
+    """Loader for test_users.parquet"""
+    def __init__(self, project_id: str = None, data_path: str = "data/raw/test/test_users.parquet"):
+        # Not a directory, but ParquetDataLoader might support files
+        super().__init__(data_path=data_path, table_name="test_users", project_id=project_id)
+
+    def get_schema(self) -> dict:
+        return {
+            'user_id': str
+        }

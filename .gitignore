@@ -1,10 +1,38 @@
+# Python
 .venv/
-.agent/
 __pycache__/
 *.pyc
 .pytest_cache/
+*.egg-info/
 
+# Data & Models (large files)
+.cache/
+outputs/
+/data/
+
+# Submissions & logs
+submission*.csv
+submission*.zip
+*.log
+eval.log
+
+# IDE
 .agent/
-de_thi.txt
+.claude/
+
+# Non-code docs (commit separately if needed)
 *.pdf
+de_thi.txt
+dethi.txt
 Colab_Runner.ipynb
+01_EDA_and_Insights.ipynb
+sample_submission.csv
+
+# Misc
+tmp_*
+*.md.bak
+recommendation_sota.md
+best_algorithm_summary.md
+"Analyzing Datathon 2026 Requirements.md"
+"Optimizing Real Estate Recommendation Pipeline1.md"
+"Optimizing Real Estate Recommendation Pipeline2.md"
