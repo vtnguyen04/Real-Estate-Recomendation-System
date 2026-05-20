@@ -1,100 +1,167 @@
 import polars as pl
-from typing import List
-from src.core.base import BaseRule, RecommendationContext
+from collections import defaultdict
+from typing import List, Optional
+
+from src.features.feature_context import FeatureContext
+from src.features.base import BaseHeuristicExtractor
+from src.features.extractors.collaborative import CollaborativeExtractor
+from src.utils.polars_utils import safe_fill_null_numeric
+from src.utils.logging import get_logger
+
+logger = get_logger("feature_engineer")
+
+
+
+
 
 class FeatureEngineer:
     """
-    Aggregates deterministic rules, user profiles, item profiles, and embeddings 
-    to create the final dense feature matrix for the ML Ranker (LightGBM).
-    Implementation exactly mirrors Task 2.6 in the Strategy Playbook, optimized via Polars LazyFrames.
-    """
-    def __init__(self, deterministic_rules: List[BaseRule]):
-        # Base rules: geo_score, urgency_score, quality_score, match_score, value_score
-        self.rules = deterministic_rules
+    SOLID Orchestrator for Feature Engineering.
+    Delegates heuristic scoring to a list of specific BaseHeuristicExtractors.
+    Follows OCP — to add new features, pass a new extractor without modifying this class.
 
-    def engineer_features(self, 
-                          candidate_items: pl.LazyFrame, 
-                          user_profile: pl.LazyFrame,
-                          item_profile: pl.LazyFrame,
-                          interactions: pl.LazyFrame = None,
-                          session_embeddings: pl.LazyFrame = None,
-                          graph_embeddings: pl.LazyFrame = None,
-                          context: RecommendationContext = None) -> pl.LazyFrame:
+    Two modes:
+      - Training: extract_for_training(pairs) uses each extractor's build_feature_df()
+        (constructor-injected raw data, lazy-cached on first call).
+      - Inference: fit_state() fills the shared FeatureContext; extract() uses extract_scores().
+    """
+
+    def __init__(self, extractors: List[BaseHeuristicExtractor], context: Optional[FeatureContext] = None):
+        self.extractors = extractors
+        self.context = context or FeatureContext()
+        self._cached_feature_dfs: Optional[list] = None  # [(join_key, df), ...]
+
+    # ── Training ───────────────────────────────────────────────
+
+    def extract_for_training(self, train_pairs: pl.DataFrame) -> pl.DataFrame:
         """
-        Builds the comprehensive (user, item) feature matrix.
-        
-        Args:
-            candidate_items: LazyFrame with pairs of (user_id, item_id)
-            user_profile: LazyFrame with user aggregate features
-            item_profile: LazyFrame with item aggregate features + dimensions
-            interactions: Optional LazyFrame containing historical interaction logs
-            session_embeddings: Optional LazyFrame for GRU session vectors
-            graph_embeddings: Optional LazyFrame for GraphSAGE item vectors
-            context: The recommendation context
+        Join all extractor feature DataFrames onto train_pairs and compute match features.
+        Feature DataFrames are built once from each extractor's build_feature_df() and cached.
         """
-        
-        # 1. Base Joins
-        df = candidate_items
-        if user_profile is not None:
-            df = df.join(user_profile, on="user_id", how="left")
-        if item_profile is not None:
-            df = df.join(item_profile, on="item_id", how="left")
-        
-        # 2. Extract Cross-Features & Derived Signals
-        schema = df.collect_schema().names()
-        
-        # Cold-Start Detection
-        if "user_total_views" in schema:
-            df = df.with_columns([
-                (pl.col("user_total_views") < 5).cast(pl.Int32).alias("user_is_cold_start")
-            ])
-            
-        # 3. Incorporate Historical Interactions (if provided)
-        if interactions is not None:
-            # Did the user already view this specific item?
-            view_history = interactions.filter(pl.col('event_type') == 'pageview') \
-                                       .select(['user_id', 'item_id']) \
-                                       .with_columns(pl.lit(1).alias("user_viewed_this_item")) \
-                                       .unique()
-            df = df.join(view_history, on=["user_id", "item_id"], how="left")
-            df = df.with_columns(pl.col("user_viewed_this_item").fill_null(0))
-            
-            # Session Price Ratio
-            if "price_vnd" in schema and "session_id" in interactions.collect_schema().names():
-                session_prices = interactions.join(item_profile.select(['item_id', 'price_vnd']), on='item_id', how='inner')
-                session_stats = session_prices.group_by("user_id").agg([
-                    pl.col("price_vnd").mean().alias("session_avg_price")
-                ])
-                df = df.join(session_stats, on="user_id", how="left")
-                df = df.with_columns([
-                    (pl.col("price_vnd") / (pl.col("session_avg_price") + 1.0)).alias("session_price_ratio")
-                ])
-                
-        # 3.5 Market Value Aggregates (for ValueScoreRule)
-        if "price_vnd" in schema and "category" in schema and "district_name" in schema:
-            market_stats = item_profile.group_by(["category", "district_name"]).agg([
-                pl.col("price_vnd").median().alias("market_avg_price")
-            ])
-            df = df.join(market_stats, on=["category", "district_name"], how="left")
-            # Rename price_vnd to price for ValueScoreRule consistency or vice versa
-            df = df.with_columns(pl.col("price_vnd").alias("price"))
-                
-        # 4. Apply Deterministic Scoring Rules (Geo, Urgency, Quality, Match)
-        # Sort by priority just in case rules have dependencies
-        for rule in sorted(self.rules, key=lambda x: getattr(x, 'priority', 0), reverse=True):
-            df = rule.apply(df, context)
-            
-        # 5. Attach Advanced Deep Learning Embeddings
-        if session_embeddings is not None:
-            # Expects columns: ['user_id', 'session_emb_0', ..., 'session_emb_N']
-            df = df.join(session_embeddings, on="user_id", how="left")
-            
-        if graph_embeddings is not None:
-            # Expects columns: ['item_id', 'graph_emb_0', ..., 'graph_emb_N']
-            df = df.join(graph_embeddings, on="item_id", how="left")
-            
-        # 6. Final Data Cleaning
-        # Fill missing numeric values with -1 (Standard for LightGBM)
-        df = df.fill_null(-1)
-            
+        if self._cached_feature_dfs is None:
+            self._cached_feature_dfs = []
+            for ext in self.extractors:
+                feat_df = ext.build_feature_df(self.context)
+                if feat_df is not None:
+                    self._cached_feature_dfs.append((ext.join_key, feat_df))
+            logger.info(
+                f"Built {len(self._cached_feature_dfs)} feature DataFrames "
+                f"from {len(self.extractors)} extractors."
+            )
+
+        df = train_pairs
+        for join_key, feat_df in self._cached_feature_dfs:
+            if join_key and join_key != "pairs":
+                df = df.join(feat_df, on=join_key, how="left")
+        df = safe_fill_null_numeric(df)
+
+        # Apply pairwise extractors via polymorphism (OCP)
+        for ext in self.extractors:
+            df = ext.compute_match_features(df)
+
         return df
+
+    def attach_features_inference(
+        self,
+        pairs: pl.DataFrame,
+        user_stats_df: pl.DataFrame,
+        item_stats_df: pl.DataFrame,
+        item_meta_df: pl.DataFrame,
+    ) -> pl.DataFrame:
+        """
+        Join pre-built lookup DataFrames onto pairs and compute match features using instance extractors.
+        Used by evaluate.py during inference.
+        """
+        stat_cols = ["user_id"]
+        for col in ["event_count", "contact_rate", "pref_city", "pref_cat", "pref_price", "pref_ad_type"]:
+            if col in user_stats_df.columns:
+                stat_cols.append(col)
+
+        df = pairs.join(user_stats_df.select(stat_cols), on="user_id", how="left")
+        df = df.join(item_stats_df, on="item_id", how="left")
+        df = df.join(item_meta_df, on="item_id", how="left")
+        df = safe_fill_null_numeric(df)
+
+        # Apply pairwise extractors via polymorphism (OCP)
+        for ext in self.extractors:
+            df = ext.compute_match_features(df)
+
+        return df
+
+    # ── Inference ──────────────────────────────────────────────
+
+    def fit_state(
+        self,
+        df_listing_collected: pl.DataFrame,
+        interactions_collected: pl.DataFrame,
+        pageviews_collected: "pl.DataFrame | pl.LazyFrame",
+        df_snapshot_collected: Optional[pl.DataFrame] = None,
+    ):
+        """Fill the shared FeatureContext inference dicts from raw data."""
+        self.context.fit(
+            df_listing_collected,
+            interactions_collected,
+            pageviews_collected,
+            df_snapshot_collected,
+        )
+
+    def extract(self, data: pl.LazyFrame) -> pl.LazyFrame:
+        """
+        Generate top candidates and compute features for all users in data (Inference Mode).
+        For training, use extract_for_training() instead.
+        """
+        df = data.collect()
+        users = df["user_id"].unique().to_list()
+        logger.info(f"Extracting candidates for {len(users)} users via {len(self.extractors)} extractors...")
+
+        for ext in self.extractors:
+            if isinstance(ext, CollaborativeExtractor):
+                ext.prefetch_batch(users, self.context)
+
+        from concurrent.futures import ThreadPoolExecutor
+        import multiprocessing
+
+        def process_user(uid):
+            features = defaultdict(dict)
+            for ext in self.extractors:
+                ext.extract_scores(uid, self.context, features)
+            final_scores = {}
+            for it, f in features.items():
+                total = (
+                    f.get("score_prev", 0.0) + f.get("score_seller", 0.0) +
+                    f.get("score_als", 0.0) + f.get("score_i2i", 0.0) + f.get("score_segpop", 0.0)
+                )
+                final_scores[it] = total
+                f["item_total_contacts"] = float(self.context.item_stats.get(it, {}).get("contacts", 0))
+                f["item_total_views"]    = float(self.context.item_stats.get(it, {}).get("views", 0))
+            user_rows = []
+            for it in sorted(final_scores, key=lambda x: -final_scores[x])[:300]:
+                r = {"user_id": uid, "item_id": it, "pre_score": final_scores[it]}
+                r.update(features[it])
+                user_rows.append(r)
+            return user_rows
+
+        n_workers = min(16, multiprocessing.cpu_count())
+        logger.info(f"Parallelizing extraction with {n_workers} threads, streaming to disk...")
+
+        written_batches = []
+        batch_size = 500
+
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            batch = []
+            for user_rows in executor.map(process_user, users):
+                batch.extend(user_rows)
+                if len(batch) >= batch_size * 100:
+                    df_batch = pl.DataFrame(batch)
+                    out = f"/tmp/feat_batch_{len(written_batches)}.parquet"
+                    df_batch.write_parquet(out)
+                    written_batches.append(out)
+                    batch.clear()
+            if batch:
+                df_batch = pl.DataFrame(batch)
+                out = f"/tmp/feat_batch_{len(written_batches)}.parquet"
+                df_batch.write_parquet(out)
+                written_batches.append(out)
+
+        logger.info(f"Written {len(written_batches)} batches to disk, reading back...")
+        return pl.scan_parquet(written_batches)

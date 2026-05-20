@@ -12,13 +12,39 @@ class HealthMetrics:
     - Category Entropy
     - Fairness (Seller Type & Category distribution match)
     - Freshness (Exponential decay)
+
+    gt_dist is calibrated from actual training contact data by
+    src/eda/round_09_health_baseline.py and stored in .cache/gt_dist.json.
     """
-    def __init__(self, ground_truth_dist: Dict[str, Any] = None):
-        # ground_truth_dist: e.g. {'agent_ratio': 0.7, 'category_dist': {1010: 0.2, ...}}
-        self.gt_dist = ground_truth_dist or {
-            'agent_ratio': 0.7,
-            'category_dist': {1010: 0.3, 1020: 0.4, 1030: 0.1, 1040: 0.1, 1050: 0.1}
-        }
+    # Default calibrated from EDA R09 (training contact distribution)
+    _DEFAULT_GT_DIST: Dict[str, Any] = {
+        "agent_ratio": 0.520,
+        "category_dist": {
+            1010: 0.156, 1020: 0.446, 1030: 0.065, 1040: 0.102, 1050: 0.231
+        },
+    }
+
+    def __init__(self, ground_truth_dist: Dict[str, Any] = None, gt_dist_path: str = None):
+        """
+        Args:
+            ground_truth_dist: Explicit gt_dist dict (overrides file if provided).
+            gt_dist_path:      Path to JSON file produced by EDA R09.
+                               Falls back to _DEFAULT_GT_DIST if file not found.
+        """
+        if ground_truth_dist is not None:
+            self.gt_dist = ground_truth_dist
+        elif gt_dist_path is not None:
+            import json, os
+            try:
+                with open(gt_dist_path) as f:
+                    raw = json.load(f)
+                # JSON keys are strings; coerce category keys to int
+                raw["category_dist"] = {int(k): v for k, v in raw["category_dist"].items()}
+                self.gt_dist = raw
+            except Exception:
+                self.gt_dist = self._DEFAULT_GT_DIST
+        else:
+            self.gt_dist = self._DEFAULT_GT_DIST
 
     def compute_diversity(self, items: List[Dict[str, Any]]) -> float:
         """
