@@ -7,7 +7,7 @@ class InferencePipeline:
     """
     Production Inference Pipeline orchestrating the 4-stage hybrid system.
     """
-    def __init__(self, 
+    def __init__(self,
                  candidate_generator: BaseRecommender,
                  feature_engineer: FeatureEngineer,
                  ranker: BaseRecommender,
@@ -19,8 +19,8 @@ class InferencePipeline:
         self.reranker = reranker
         self.config = config or {}
 
-    def run(self, 
-            user_id: str, 
+    def run(self,
+            user_id: str,
             k: int = 10,
             user_profile: pl.LazyFrame = None,
             item_profile: pl.LazyFrame = None,
@@ -31,11 +31,11 @@ class InferencePipeline:
         Executes the end-to-end recommendation flow.
         """
         context = RecommendationContext(user_id=user_id, num_recommendations=k)
-        
+
         # STAGE 1: Candidate Generation (Stage 1)
         # Returns ~500 candidates
         candidates = self.candidate_generator.recommend(context)
-        
+
         # STAGE 2: Feature Engineering & Deterministic Scoring (Stage 2)
         # Apply rules and prepare dense feature matrix
         featured_candidates = self.feature_engineer.engineer_features(
@@ -47,20 +47,20 @@ class InferencePipeline:
             graph_embeddings=graph_embeddings,
             context=context
         )
-        
+
         # STAGE 3: ML Ranking (Stage 3)
         # Ranks candidates based on multi-task LightGBM scores
         ranked_candidates = self.ranker.recommend(context, featured_candidates)
-        
+
         # STAGE 4: Multi-Objective Re-ranking (Stage 4)
         # Greedy selection for health objectives (Diversity, Fairness, Freshness)
         # Usually re-ranks top 30-50 candidates down to top-k
         top_n_for_rerank = self.config.get("top_n_for_rerank", 30)
         final_recommendations = self.reranker.rerank(
-            ranked_candidates.head(top_n_for_rerank), 
+            ranked_candidates.head(top_n_for_rerank),
             k=k
         )
-        
+
         return final_recommendations
 
     @classmethod

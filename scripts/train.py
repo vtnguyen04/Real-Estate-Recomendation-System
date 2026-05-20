@@ -1,89 +1,62 @@
 """
-Main script to trigger the training pipeline end-to-end.
+scripts/train.py — Train ContactALS + ViewALS + SegPop + LightGBM lambdarank.
+
+All pipeline logic lives in src/pipeline/training_pipeline.py.
 """
+import sys
+import os
 import argparse
+import time
+
 import polars as pl
-from pathlib import Path
+from datetime import timedelta
 
-from src.utils.logging import get_logger
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+
 from config.settings import PipelineConfig
-from config.paths import MODELS_DIR
-from src.data.loader import ListingDataLoader, FactUserEventsLoader
-from src.pipeline.data_forensics import DataForensicsPipeline
-from src.models.candidates.als_recommender import ALSRecommender
-from src.models.baselines.popularity import PopularityRecommender
-from src.models.ensemble.weighted_ensemble import WeightedEnsembleRecommender
-from src.features.feature_engineer import FeatureEngineer
-from src.rules.geo_rules import GeoProximityScoreRule
-from src.rules.quality_rules import QualityScoreRule
-from src.rules.urgency_rules import UrgencyScoreRule
-from src.rules.match_rules import MatchScoreRule
-from src.rules.value_rules import ValueScoreRule
-from src.models.rankers.lgbm_ranker import MultiTaskLGBMRanker
 from src.pipeline.training_pipeline import TrainingPipeline
-from src.models.deep.session_gru import SessionBasedRecommender
-from src.models.deep.graph_sage import GraphBasedRecommender
+from src.utils.logging import get_logger
 
-logger = get_logger(__name__)
+logger = get_logger("train")
+CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".cache")
 
 
-def main(config_path: str = None):
-    """
-    Execute the full training pipeline.
-    """
-    logger.info("Starting end-to-end training pipeline...")
-
+def main():
     config = PipelineConfig()
-
-    logger.info("Setting up Loaders...")
-    TRAIN_PATH = f"gs://{config.data.bucket_name}/train/"
-    
-    loader_items = ListingDataLoader(project_id="", gcs_path=f"{TRAIN_PATH}dim_listing/")
-    lf_items = loader_items.load()
-    
-    loader_events = FactUserEventsLoader(project_id="", gcs_path=f"{TRAIN_PATH}fact_user_events/")
-    lf_events = loader_events.load()
-
-    logger.info("Setting up Components...")
-    als = ALSRecommender(factors=64)
-    pop = PopularityRecommender()
-    gru = SessionBasedRecommender()
-    graph = GraphBasedRecommender()
-    
-    ensemble_cg = WeightedEnsembleRecommender(
-        models=[als, gru, graph, pop], 
-        weights=[0.45, 0.25, 0.15, 0.15]
-    )
-
-    rules = [GeoProximityScoreRule(), QualityScoreRule(), UrgencyScoreRule(), MatchScoreRule(), ValueScoreRule()]
-    fe = FeatureEngineer(deterministic_rules=rules)
-    ranker = MultiTaskLGBMRanker()
-
-    # Initialize the training pipeline
-    pipeline = TrainingPipeline(
-        candidate_generator=ensemble_cg,
-        feature_engineer=fe,
-        ranker=ranker,
-        config={"validation_days": config.validation_days}
-    )
-
-    # Run the pipeline
-    try:
-        results = pipeline.run(raw_events=lf_events, item_profile=lf_items)
-        logger.info(f"Training completed successfully. Status: {results['status']}")
-
-        # Save pipeline models
-        MODELS_DIR.mkdir(parents=True, exist_ok=True)
-        pipeline.save_models(str(MODELS_DIR))
-
-        logger.info("Training pipeline finished.")
-    except Exception as e:
-        logger.error(f"Training failed: {str(e)}", exc_info=True)
-        raise
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run the recommendation training pipeline.")
-    parser.add_argument("--config", type=str, default=None, help="Path to config YAML file (optional).")
+    parser = argparse.ArgumentParser(description="Train ContactALS + ViewALS + SegPop + LightGBM")
+    parser.add_argument("--data_dir", default=config.data.train_path)
+    parser.add_argument("--output_dir", default="outputs/models/")
+    parser.add_argument("--use_gpu", action="store_true")
     args = parser.parse_args()
 
-    main(config_path=args.config)
+    t0 = time.time()
+    logger.info("=" * 60)
+    logger.info(f"TRAIN pipeline  GPU={args.use_gpu}")
+    logger.info("=" * 60)
+
+    logger.info("[1/8] Loading preprocessed data...")
+    contacts      = pl.read_parquet(os.path.join(CACHE_DIR, "contact_pairs.parquet"))
+    als_contacts  = pl.read_parquet(os.path.join(CACHE_DIR, "als_contact_pairs.parquet"))
+    als_pageviews = pl.read_parquet(os.path.join(CACHE_DIR, "als_pageview_pairs.parquet"))
+    date_range    = pl.read_parquet(os.path.join(CACHE_DIR, "date_range.parquet"))
+    df_listing    = pl.scan_parquet(os.path.join(args.data_dir, "dim_listing/*.parquet")).collect()
+
+    max_date   = date_range["max_date"][0]
+    split_date = max_date - timedelta(days=config.validation_days)
+    logger.info(f"  Max date: {max_date} | Split: {split_date}")
+
+    pipeline = TrainingPipeline(
+        config=config,
+        use_gpu=args.use_gpu,
+        output_dir=args.output_dir,
+        cache_dir=CACHE_DIR,
+    )
+    pipeline.run(contacts, als_contacts, als_pageviews, df_listing, split_date, ext_logger=logger)
+
+    elapsed = (time.time() - t0) / 60
+    logger.info(f"Done. ({elapsed:.1f} min)")
+    logger.info("=" * 60)
+
+
+if __name__ == "__main__":
+    main()

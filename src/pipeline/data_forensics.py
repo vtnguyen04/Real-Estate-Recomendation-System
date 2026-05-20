@@ -98,13 +98,14 @@ class BotActivityFilter(BaseRule):
 class BounceSessionFilter(BaseRule):
     """
     Removes accidental clicks and "bounce" interactions:
-    - Dwell time < 3 seconds AND event is not a contact/lead conversion.
+    - Dwell time < 3000ms (= 3 seconds) AND event is not a contact/lead conversion.
+    Note: EDA H-003 confirmed dwell_time_sec is actually in MILLISECONDS.
     This distills the implicit feedback (pageviews) down to only 'high-intent' signals.
     """
-    def __init__(self, min_valid_dwell_sec: float = 3.0):
+    def __init__(self, min_valid_dwell_ms: float = 3000.0):
         super().__init__(name="bounce_session_filter", is_hard_filter=True)
         self.priority = 80
-        self.min_valid_dwell_sec = min_valid_dwell_sec
+        self.min_valid_dwell_ms = min_valid_dwell_ms  # Raw units = ms
 
     def apply(self, events: pl.LazyFrame, context: RecommendationContext = None) -> pl.LazyFrame:
         schema = events.collect_schema().names()
@@ -113,11 +114,13 @@ class BounceSessionFilter(BaseRule):
         if not dwell_col or "event_type" not in schema:
             return events
             
-        positive_events = ['view_phone', 'contact_chat', 'contact_zalo', 'contact_sms', 'lead']
+        # EDA R02 H-004: other_interaction IS positive (is_contact=1)
+        positive_events = ['view_phone', 'contact_chat', 'contact_zalo',
+                           'contact_sms', 'other_interaction', 'lead']
         
-        # Keep if dwell >= 3 OR event is a high intent contact OR dwell is null (implicit assumption)
+        # Keep if dwell >= 3000ms (3s) OR event is a positive contact OR dwell is null
         return events.filter(
-            (pl.col(dwell_col) >= self.min_valid_dwell_sec) |
+            (pl.col(dwell_col) >= self.min_valid_dwell_ms) |
             (pl.col('event_type').is_in(positive_events)) |
             (pl.col(dwell_col).is_null())
         )
