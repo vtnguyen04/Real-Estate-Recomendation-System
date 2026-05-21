@@ -183,6 +183,11 @@ class LambdarankLGBMRanker(BaseRecommender):
         learning_rate: float = 0.02,
         num_rounds: int = 1000,
         early_stopping: int = 50,
+        feature_fraction: float = 0.8,
+        bagging_fraction: float = 0.9,
+        bagging_freq: int = 5,
+        min_child_samples: int = 20,
+        lambdarank_truncation_level: int = 10,
     ):
         super().__init__(name="lgbm_lambdarank")
         self.feature_cols = feature_cols or []
@@ -191,6 +196,11 @@ class LambdarankLGBMRanker(BaseRecommender):
         self.learning_rate = learning_rate
         self.num_rounds = num_rounds
         self.early_stopping = early_stopping
+        self.feature_fraction = feature_fraction
+        self.bagging_fraction = bagging_fraction
+        self.bagging_freq = bagging_freq
+        self.min_child_samples = min_child_samples
+        self.lambdarank_truncation_level = lambdarank_truncation_level
         self._model: Optional[lgb.Booster] = None
 
     def fit(self, train_df: pl.DataFrame, val_df: Optional[pl.DataFrame] = None) -> "LambdarankLGBMRanker":
@@ -224,12 +234,13 @@ class LambdarankLGBMRanker(BaseRecommender):
             "objective": "lambdarank",
             "metric": "ndcg",
             "ndcg_eval_at": [10],
+            "lambdarank_truncation_level": self.lambdarank_truncation_level,
             "num_leaves": self.num_leaves,
             "learning_rate": self.learning_rate,
-            "feature_fraction": 0.8,
-            "bagging_fraction": 0.9,
-            "bagging_freq": 5,
-            "min_child_samples": 20,
+            "feature_fraction": self.feature_fraction,
+            "bagging_fraction": self.bagging_fraction,
+            "bagging_freq": self.bagging_freq,
+            "min_child_samples": self.min_child_samples,
             "verbose": 1,
             "device_type": "gpu" if self.use_gpu else "cpu",
             "seed": 42,

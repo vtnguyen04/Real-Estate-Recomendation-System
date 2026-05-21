@@ -52,7 +52,10 @@ class FeatureEngineer:
         df = train_pairs
         for join_key, feat_df in self._cached_feature_dfs:
             if join_key and join_key != "pairs":
-                df = df.join(feat_df, on=join_key, how="left")
+                # Filter feat_df to only include keys present in the current chunk to save massive memory during join hash table construction
+                unique_keys = df[join_key].unique().to_list()
+                filtered_feat_df = feat_df.filter(pl.col(join_key).is_in(unique_keys))
+                df = df.join(filtered_feat_df, on=join_key, how="left")
         df = safe_fill_null_numeric(df)
 
         # Apply pairwise extractors via polymorphism (OCP)

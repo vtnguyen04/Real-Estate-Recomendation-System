@@ -3,6 +3,8 @@ import polars as pl
 import time
 from typing import List
 
+from datetime import date, timedelta
+
 from config.settings import PipelineConfig
 from src.utils.logging import get_logger
 
@@ -19,21 +21,26 @@ class DataPreprocessor:
         self.gt_events = config.data.positive_events
         os.makedirs(self.cache_dir, exist_ok=True)
 
-    def process_and_cache(self, lf: pl.LazyFrame):
+    def process_and_cache(self, lf: pl.LazyFrame, snapshot_path: str = ""):
         """
-        Executes all 6 pre-aggregation steps on the user events LazyFrame.
+        Executes all pre-aggregation steps on the user events LazyFrame.
+        Optionally processes fact_listing_snapshot if snapshot_path provided.
         """
         t0 = time.time()
         logger.info("=" * 60)
-        logger.info("PREPROCESSING — Aggregate 41GB events → compact cache")
+        logger.info("PREPROCESSING — Aggregate events → compact cache")
         logger.info("=" * 60)
 
         self._process_contact_pairs(lf)
         self._process_als_contact_pairs(lf)
+        self._process_weighted_als(lf)
         self._process_pageview_pairs(lf)
         self._process_date_range(lf)
         self._process_session_items(lf)
         self._process_cold_user_prefs(lf)
+
+        if snapshot_path and os.path.exists(snapshot_path):
+            self._process_snapshot_stats(snapshot_path)
 
         logger.info(f"Preprocessing done. Time: {time.time() - t0:.1f}s")
         logger.info("=" * 60)
@@ -115,6 +122,77 @@ class DataPreprocessor:
         out = os.path.join(self.cache_dir, "session_items.parquet")
         session_items.write_parquet(out)
         logger.info(f"  {out}: {len(session_items):,} sessions, {os.path.getsize(out)/1e6:.1f}MB")
+
+    def _process_weighted_als(self, lf: pl.LazyFrame):
+        """
+        INS-062: Build weighted ALS contact pairs.
+        Real contacts (view_phone, chat, zalo, sms) get weight=3,
+        other_interaction gets weight=1.
+        """
+        logger.info("── [3b/8] Weighted ALS pairs (INS-062) ──")
+        real_contacts = ["view_phone", "contact_chat", "contact_zalo", "contact_sms"]
+        weighted = (
+            lf
+            .filter(pl.col("is_login") == "login")
+            .filter(pl.col("is_contact") == 1)
+            .with_columns(
+                pl.when(pl.col("event_type").is_in(real_contacts))
+                .then(pl.lit(3.0))
+                .otherwise(pl.lit(1.0))
+                .alias("w")
+            )
+            .group_by(["user_id", "item_id"])
+            .agg(pl.col("w").sum().alias("score"))
+            .collect(engine="streaming")
+        )
+        out = os.path.join(self.cache_dir, "als_weighted_contact.parquet")
+        weighted.write_parquet(out)
+        logger.info(f"  {out}: {len(weighted):,} pairs, {os.path.getsize(out)/1e6:.1f}MB")
+
+    def _process_snapshot_stats(self, snapshot_path: str):
+        """
+        F-012/F-031: Aggregate fact_listing_snapshot into per-item features.
+        - item_avg_views_7d, item_avg_contacts_7d
+        - item_conversion_rate = contacts / (views + 1)
+        - item_trend_score = recent_views / (prior_views + 1)
+        - item_is_active = had activity in last 7 days
+        """
+        logger.info("── [8/8] fact_listing_snapshot → item features ──")
+        snap = pl.scan_parquet(os.path.join(snapshot_path, "*.parquet"))
+        max_date = snap.select(pl.col("date").max()).collect().item()
+        d7 = max_date - timedelta(days=7)
+        d30 = max_date - timedelta(days=30)
+
+        # Recent 7d stats
+        recent = (
+            snap.filter(pl.col("date") >= d7)
+            .group_by("item_id").agg([
+                pl.col("views_24h").mean().cast(pl.Float32).alias("item_avg_views_7d"),
+                pl.col("contacts_24h").mean().cast(pl.Float32).alias("item_avg_contacts_7d"),
+            ])
+            .collect()
+        )
+
+        # Prior 8-30d stats for trend
+        prior = (
+            snap.filter((pl.col("date") >= d30) & (pl.col("date") < d7))
+            .group_by("item_id").agg([
+                pl.col("views_24h").mean().cast(pl.Float32).alias("prior_views"),
+            ])
+            .collect()
+        )
+
+        stats = recent.join(prior, on="item_id", how="left").with_columns([
+            (pl.col("item_avg_contacts_7d").fill_null(0) / (pl.col("item_avg_views_7d").fill_null(0) + 1))
+                .cast(pl.Float32).alias("item_conversion_rate"),
+            (pl.col("item_avg_views_7d").fill_null(0) / (pl.col("prior_views").fill_null(0) + 1))
+                .cast(pl.Float32).alias("item_trend_score"),
+            pl.lit(1.0).cast(pl.Float32).alias("item_is_active"),
+        ]).drop("prior_views")
+
+        out = os.path.join(self.cache_dir, "snapshot_stats.parquet")
+        stats.write_parquet(out)
+        logger.info(f"  {out}: {len(stats):,} items, {os.path.getsize(out)/1e6:.1f}MB")
 
     def _process_cold_user_prefs(self, lf: pl.LazyFrame):
         """
