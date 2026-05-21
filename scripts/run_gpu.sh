@@ -37,8 +37,11 @@ case "$MODE" in
   submission)
     exec $PYTHON_BIN scripts/inference.py "${@:2}"
     ;;
+  python)
+    exec $PYTHON_BIN "${@:2}"
+    ;;
   *)
-    echo "Usage: $0 {preprocess|train|evaluate|inference|submission}"
+    echo "Usage: $0 {preprocess|train|evaluate|inference|submission|python <script>}"
     exit 1
     ;;
 esac

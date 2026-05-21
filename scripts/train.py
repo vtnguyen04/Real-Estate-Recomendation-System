@@ -51,7 +51,10 @@ def main():
         output_dir=args.output_dir,
         cache_dir=CACHE_DIR,
     )
+    # Delete heavy DataFrames from caller scope after pipeline takes them.
+    # pipeline.run() will delete its own references when no longer needed.
     pipeline.run(contacts, als_contacts, als_pageviews, df_listing, split_date, ext_logger=logger)
+    del contacts, als_contacts, als_pageviews, df_listing
 
     elapsed = (time.time() - t0) / 60
     logger.info(f"Done. ({elapsed:.1f} min)")

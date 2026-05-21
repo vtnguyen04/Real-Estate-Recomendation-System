@@ -24,10 +24,17 @@ from src.features.extractors.item_stats import ItemStatsExtractor
 from src.features.extractors.recent_history import RecentHistoryExtractor
 from src.features.extractors.seller_affinity import SellerAffinityExtractor
 from src.features.extractors.preference_match import PreferenceMatchExtractor
+from src.features.extractors.item_snapshot import ItemSnapshotExtractor
 from src.features.feature_engineer import FeatureEngineer
 from src.models.candidates.light_als import LightALSRecommender
 from src.models.candidates.segment_popularity import SegmentPopularityRecommender
+from src.models.candidates.pageview_replay import PageviewReplayRecommender
+from src.models.candidates.cocontact import CoContactRecommender
+from src.models.candidates.intent_recommender import IntentRecommender
+from src.models.candidates.user_knn import UserKNNRecommender
+from src.models.candidates.seller_recommender import SellerExpansionRecommender
 from src.models.ensemble.ensemble_generator import EnsembleCandidateGenerator
+from src.models.ensemble.cascade_generator import CascadeCandidateGenerator
 from src.models.rankers.lgbm_ranker import LambdarankLGBMRanker
 from src.evaluation.metrics import recall_at_k, ndcg_at_k
 from src.utils.logging import get_logger
@@ -37,7 +44,8 @@ logger = get_logger(__name__)
 
 class TrainingPipeline:
     """
-    Orchestrates ContactALS + ViewALS + SegPop + LightGBM lambdarank training.
+    Orchestrates ALS + SegPop + LightGBM lambdarank training.
+    Supports both CascadeGen (INS-052 fix) and EnsembleGen (legacy) for candidate generation.
 
     All hyper-parameters read from PipelineConfig — no hardcoded values.
 
@@ -62,6 +70,7 @@ class TrainingPipeline:
         self.als: Optional[LightALSRecommender] = None
         self.als_view: Optional[LightALSRecommender] = None
         self.ensemble_gen: Optional[EnsembleCandidateGenerator] = None
+        self.cascade_gen: Optional[CascadeCandidateGenerator] = None
         self.ranker: Optional[LambdarankLGBMRanker] = None
 
     # ── Candidate generation ────────────────────────────────────
@@ -75,17 +84,30 @@ class TrainingPipeline:
         label_col: bool = True,
     ) -> pl.DataFrame:
         """
-        Generate (user, item) candidate pairs with actual ALS affinity scores.
-        Delegates to EnsembleCandidateGenerator to respect SRP and DRY.
+        Generate (user, item) candidate pairs with source tracking.
+        Uses CascadeGen (cascade/hybrid) or EnsembleGen (legacy) to match inference distribution.
         """
-        df, _ = self.ensemble_gen.generate_batch(
-            users=users,
-            user_prefs=user_prefs,
-            valid_items=valid_items,
-            pos_set=pos_set,
-            label_col=label_col
-        )
-        return df
+        if self.cascade_gen is not None:
+            # INS-052 FIX: Use SAME cascade generator as inference
+            return self.cascade_gen.generate_batch_with_sources(
+                user_ids=users,
+                user_prefs=user_prefs,
+                k=self.cfg.cascade.hybrid_pool_size,
+                valid_items=valid_items,
+                pos_set=pos_set,
+                label_col=label_col,
+            )
+        elif self.ensemble_gen is not None:
+            df, _ = self.ensemble_gen.generate_batch(
+                users=users,
+                user_prefs=user_prefs,
+                valid_items=valid_items,
+                pos_set=pos_set,
+                label_col=label_col,
+            )
+            return df
+        else:
+            raise RuntimeError("No candidate generator available. Check inference_mode config.")
 
     # ── Main entry point ────────────────────────────────────────
 
@@ -134,46 +156,225 @@ class TrainingPipeline:
             global_k=cfg.segpop_global_k,
         )
         self.segpop.fit_from_pairs(train_contacts, valid_items=valid_items, listing_df=df_listing)
-        # INS-053 fix: save as segpop_trained.pkl to avoid overwriting recency segpop.pkl
-        self.segpop.save(os.path.join(self.output_dir, "segpop_trained.pkl"))
-        log.info("  SegPop saved as segpop_trained.pkl (NOT overwriting segpop.pkl).")
+        # Save as segpop.pkl — the name inference expects
+        self.segpop.save(os.path.join(self.output_dir, "segpop.pkl"))
+        log.info("  SegPop saved as segpop.pkl.")
 
         # ── ContactALS ──────────────────────────────────────────
+        # Build clean, non-leaked ALS training pairs <= split_date to prevent future-inventory/val leakage
+        log.info(f"[3/8] Building clean, non-leaked ALS training pairs <= {split_date}...")
+        events_path = os.path.join(cfg.data.train_path, "fact_user_events/*.parquet")
+        pci_path = os.path.join(cfg.data.train_path, "fact_post_contact_interactions/*.parquet")
+        
+        events_lazy = pl.scan_parquet(events_path).filter(pl.col("date") <= split_date)
+        
+        if cfg.model.als_use_weighted:
+            real_contacts = ["view_phone", "contact_chat", "contact_zalo", "contact_sms"]
+            events_pairs = (
+                events_lazy
+                .filter(pl.col("is_login") == "login")
+                .filter(pl.col("is_contact") == 1)
+                .with_columns(
+                    pl.when(pl.col("event_type").is_in(real_contacts))
+                    .then(pl.lit(3.0))
+                    .otherwise(pl.lit(1.0))
+                    .alias("w")
+                )
+                .group_by(["user_id", "item_id"])
+                .agg(pl.col("w").sum().alias("score"))
+                .collect()
+            )
+        else:
+            events_pairs = (
+                events_lazy
+                .filter(pl.col("is_login") == "login")
+                .filter(pl.col("is_contact") == 1)
+                .group_by(["user_id", "item_id"])
+                .agg(pl.len().cast(pl.Float32).alias("score"))
+                .collect()
+            )
+            
+        log.info(f"    Raw event pairs: {len(events_pairs):,}")
+        
+        if cfg.pci_enabled and pci_path:
+            import glob
+            pci_files = glob.glob(pci_path)
+            if pci_files:
+                pci_lazy = pl.scan_parquet(pci_path).filter(
+                    (pl.col("date") <= split_date) & 
+                    (pl.col("lead_count") >= 1)
+                )
+                pci_pairs = (
+                    pci_lazy
+                    .with_columns(
+                        pl.when(pl.col("purchased") == True)
+                        .then(pl.col("lead_count") * 3.0)
+                        .otherwise(pl.col("lead_count").cast(pl.Float64))
+                        .alias("score")
+                    )
+                    .select(["user_id", "item_id", "score"])
+                    .collect()
+                )
+                # Apply existing_only filter
+                existing_users = set(events_pairs["user_id"].unique().to_list())
+                pci_pairs = pci_pairs.filter(pl.col("user_id").is_in(list(existing_users)))
+                
+                if len(pci_pairs) > 0:
+                    events_pairs = events_pairs.with_columns(pl.col("score").cast(pl.Float64))
+                    pci_pairs = pci_pairs.with_columns(pl.col("score").cast(pl.Float64))
+                    merged = pl.concat([events_pairs, pci_pairs])
+                    events_pairs = (
+                        merged.group_by(["user_id", "item_id"])
+                        .agg(pl.col("score").sum())
+                        .with_columns(pl.col("score").cast(pl.Float32))
+                    )
+                    log.info(f"    Total merged ALS pairs: {len(events_pairs):,}")
+            else:
+                log.warning("    No PCI files found.")
+                
+        als_training_data = events_pairs
+        
+        # Save this clean data to cache so it can be loaded for rebuilding matrix without leak
+        clean_als_path = os.path.join(self.cache_dir, "clean_als_training_data.parquet")
+        als_training_data.write_parquet(clean_als_path)
+        log.info(f"  Saved clean ALS data to {clean_als_path}")
+
         log.info(
-            f"[3/8] Fitting ContactALS "
-            f"(f={cfg.model.als_factors}, i={cfg.model.als_iterations}, gpu={self.use_gpu})..."
+            f"  ContactALS (f={cfg.model.als_factors}, i={cfg.model.als_iterations}, gpu={self.use_gpu})"
         )
         self.als = LightALSRecommender(
             factors=cfg.model.als_factors,
+            regularization=cfg.model.als_regularization,
             iterations=cfg.model.als_iterations,
             use_gpu=self.use_gpu,
         )
-        self.als.fit(als_contacts.lazy())
+        self.als.fit(als_training_data.lazy())
         self.als.save(os.path.join(self.output_dir, "als"))
         log.info("  ContactALS saved.")
+        del als_training_data
 
-        # ── ViewALS ─────────────────────────────────────────────
-        log.info(
-            f"[4/8] Fitting ViewALS "
-            f"(f={cfg.model.als_view_factors}, i={cfg.model.als_view_iterations}, gpu={self.use_gpu})..."
+        # ── ViewALS (only if budget > 0) ──────────────────────────
+        has_view_als = (
+            cfg.cascade.budget_pool.get("als_view", 0) > 0
+            or cfg.cascade.budget_top10.get("als_view", 0) > 0
         )
-        self.als_view = LightALSRecommender(
-            factors=cfg.model.als_view_factors,
-            iterations=cfg.model.als_view_iterations,
-            use_gpu=self.use_gpu,
-        )
-        self.als_view.fit(als_pageviews.select(["user_id", "item_id", "view_count"]).lazy())
-        self.als_view.save(os.path.join(self.output_dir, "als_view"))
-        log.info("  ViewALS saved.")
-        del als_pageviews; gc.collect()
+        if has_view_als:
+            log.info(
+                f"[4/8] Fitting ViewALS "
+                f"(f={cfg.model.als_view_factors}, i={cfg.model.als_view_iterations}, gpu={self.use_gpu})..."
+            )
+            self.als_view = LightALSRecommender(
+                factors=cfg.model.als_view_factors,
+                iterations=cfg.model.als_view_iterations,
+                use_gpu=self.use_gpu,
+            )
+            self.als_view.fit(als_pageviews.select(["user_id", "item_id", "view_count"]).lazy())
+            self.als_view.save(os.path.join(self.output_dir, "als_view"))
+            log.info("  ViewALS saved.")
+        else:
+            log.info("[4/8] ViewALS skipped (budget=0, INS-047).")
+            # Clean up stale artifact to prevent inference from loading disabled model
+            stale_als_view = os.path.join(self.output_dir, "als_view")
+            if os.path.isdir(stale_als_view):
+                import shutil
+                shutil.rmtree(stale_als_view)
+                log.info("  Removed stale als_view artifact.")
+        del als_pageviews
 
-        # ── Ensemble Generator ───────────────────────────────────
-        self.ensemble_gen = EnsembleCandidateGenerator(
-            als=self.als, als_view=self.als_view, segpop=self.segpop,
-            n_cand_als=cfg.model.n_cand_als,
-            n_cand_view_als=cfg.model.n_cand_view_als,
-            n_cand_segpop=cfg.model.n_cand_segpop
-        )
+        # Keep ContactALS sparse matrix in memory to avoid OOM during rebuild
+        # self.als._matrix = None
+
+        # Free raw input DataFrames no longer needed after ALS + split
+        del als_contacts, contacts
+        gc.collect()
+        log.info("  Released ALS matrix + input DataFrames.")
+        if cfg.inference_mode == "cascade":
+            log.info("  Inference mode is cascade. Skipping LightGBM ranker training as requested.")
+            return self
+
+        if cfg.inference_mode in ("hybrid",):
+            log.info("  Fitting FULL CascadeCandidateGenerator (INS-052 fix)")
+            gc.collect()  # Free any leftover ALS build temporaries
+
+            cc = cfg.cascade
+            events_path = os.path.join(cfg.data.train_path, "fact_user_events/*.parquet")
+
+            def _log_ram(label):
+                import resource
+                rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024  # MB
+                log.info(f"    RAM({label}): RSS={rss:.0f}MB")
+
+            # PageviewReplay
+            log.info("    Fitting PageviewReplay...")
+            pv_replay = PageviewReplayRecommender(
+                window_days=cc.pv_window_days, max_items_per_user=cc.pv_max_items_per_user)
+            pv_replay.fit(events_path, user_ids=set(train_users), cutoff_date=split_date)
+            gc.collect(); _log_ram("after_pv")
+
+            # CoContact
+            log.info("    Fitting CoContact...")
+            cocontact = CoContactRecommender(window_days=cc.cocontact_window_days)
+            cocontact.fit(train_contacts, cutoff_date=split_date)
+
+            # RecentCC + User histories (lightweight dict ops)
+            log.info("    Building RecentCC + UserHistories...")
+            recent_cc = CascadeCandidateGenerator.build_recent_cc(
+                train_contacts, cutoff_date=split_date,
+                window_days=cc.recent_cc_window_days,
+                max_items_per_segment=cc.recent_cc_max_items_per_segment,
+            )
+            user_histories = CascadeCandidateGenerator.build_user_histories(
+                train_contacts, user_ids=set(train_users),
+                max_items=cc.user_history_max_items,
+            )
+            gc.collect(); _log_ram("after_cc_hist")
+
+            # Intent — loads PV events (can be large)
+            log.info("    Fitting IntentRecommender...")
+            intent_rec = IntentRecommender(max_items_per_intent=cc.intent_max_items_per_intent)
+            pvs = (
+                pl.scan_parquet(events_path)
+                .filter(
+                    (pl.col("event_ts") <= split_date)
+                    & (pl.col("event_ts") >= split_date - pl.duration(days=cc.pv_window_days))
+                    & (pl.col("event_type") == "pageview")
+                )
+                .select(["user_id", "item_id"]).collect()
+            )
+            log.info(f"    Intent PV events loaded: {len(pvs):,}")
+            intent_rec.fit(pvs=pvs, dim_listing=df_listing, valid_items=valid_items)
+            del pvs; gc.collect(); _log_ram("after_intent")
+
+            # UserKNN — builds large Python dicts
+            log.info("    Fitting UserKNN...")
+            user_knn = UserKNNRecommender(max_neighbors_per_item=cc.user_knn_max_neighbors)
+            user_knn.fit(train_contacts.lazy(), query_user_ids=set(train_users), valid_items=valid_items)
+            gc.collect(); _log_ram("after_knn")
+
+            # Seller
+            log.info("    Fitting SellerExpansion...")
+            seller_rec = SellerExpansionRecommender(max_items_per_seller=cc.seller_max_items_per_seller)
+            seller_rec.fit(train_contacts.lazy(), listing_df=df_listing, query_user_ids=set(train_users))
+            _log_ram("after_seller")
+
+            item_cities = dict(zip(df_listing["item_id"].to_list(), df_listing["city_name"].to_list()))
+
+            self.cascade_gen = CascadeCandidateGenerator(
+                pv_replay=pv_replay, cocontact=cocontact, segpop=self.segpop,
+                als=self.als, als_view=self.als_view,
+                recent_cc=recent_cc, user_histories=user_histories,
+                intent_rec=intent_rec, user_knn=user_knn,
+                seller_rec=seller_rec, item_cities=item_cities,
+                cascade_cfg=cc,
+            )
+            log.info("  Cascade fitted with ALL sources.")
+        else:
+            self.ensemble_gen = EnsembleCandidateGenerator(
+                als=self.als, als_view=self.als_view, segpop=self.segpop,
+                n_cand_als=cfg.model.n_cand_als,
+                n_cand_view_als=cfg.model.n_cand_view_als,
+                n_cand_segpop=cfg.model.n_cand_segpop
+            )
 
         # ── Feature lookup tables via extractors ─────────────────
         log.info("[5/8] Building feature lookup tables via extractors...")
@@ -184,7 +385,15 @@ class TrainingPipeline:
         recent_ext     = RecentHistoryExtractor(train_contacts)
         seller_ext     = SellerAffinityExtractor(train_contacts, df_listing)
         match_ext      = PreferenceMatchExtractor()
-        feature_eng    = FeatureEngineer([user_ext, item_stats_ext, item_meta_ext, recent_ext, seller_ext, match_ext])
+
+        # F-012/F-031: Snapshot-based item features
+        snapshot_path = os.path.join(self.cache_dir, "snapshot_stats.parquet")
+        snapshot_ext = ItemSnapshotExtractor(snapshot_path)
+
+        feature_eng    = FeatureEngineer([
+            user_ext, item_stats_ext, item_meta_ext,
+            recent_ext, seller_ext, match_ext, snapshot_ext,
+        ])
         del als_pv_reload; gc.collect()
 
         user_stats_df = user_ext.build_feature_df()
@@ -195,6 +404,10 @@ class TrainingPipeline:
 
         # ── Training candidates ──────────────────────────────────
         log.info("[6/8] Generating training candidates (ALS-first)...")
+
+        # ContactALS matrix is already in memory, no need to rebuild
+        log.info("  ContactALS matrix is already in memory. Rebuild skipped to save memory.")
+        gc.collect()
         rng = np.random.default_rng(42)
         sampled = rng.choice(
             train_users, size=min(cfg.n_train_users, len(train_users)), replace=False
@@ -240,7 +453,28 @@ class TrainingPipeline:
         )
 
         # ── LightGBM ─────────────────────────────────────────────
-        log.info("[7/8] Training LightGBM lambdarank...")
+        # Build and save feature DFs BEFORE releasing extractors
+        log.info("[7/8] Saving feature artefacts + training LightGBM...")
+        item_stats_df = item_stats_ext.build_feature_df()
+        item_meta_df  = item_meta_ext.build_feature_df()
+        user_stats_df.write_parquet(os.path.join(self.output_dir, "user_stats.parquet"))
+        item_stats_df.write_parquet(os.path.join(self.output_dir, "item_stats.parquet"))
+        item_meta_df.write_parquet(os.path.join(self.output_dir, "item_meta.parquet"))
+        if os.path.exists(snapshot_path):
+            import shutil
+            shutil.copy2(snapshot_path, os.path.join(self.output_dir, "snapshot_stats.parquet"))
+            log.info("  snapshot_stats.parquet copied to model dir")
+
+        # Release heavy objects no longer needed for LGBM
+        self.cascade_gen = None
+        if hasattr(self, 'als') and self.als is not None:
+            self.als._matrix = None
+        del train_contacts, df_listing, item_stats_df, item_meta_df
+        del user_ext, item_stats_ext, item_meta_ext, recent_ext, seller_ext, match_ext, snapshot_ext
+        del feature_eng
+        gc.collect()
+        log.info("  Released cascade + extractors for LGBM.")
+
         r = cfg.ranker
         self.ranker = LambdarankLGBMRanker(
             feature_cols=available_feats,
@@ -249,17 +483,17 @@ class TrainingPipeline:
             learning_rate=r.learning_rate,
             num_rounds=r.n_estimators,
             early_stopping=r.early_stopping_rounds,
+            feature_fraction=r.feature_fraction,
+            bagging_fraction=r.bagging_fraction,
+            bagging_freq=r.bagging_freq,
+            min_child_samples=r.min_child_samples,
+            lambdarank_truncation_level=r.lambdarank_truncation_level,
         )
         self.ranker.fit(df_train, val_df=df_val)
 
         # ── Save artefacts ────────────────────────────────────────
-        log.info("[8/8] Saving artefacts...")
+        log.info("[8/8] Saving ranker model...")
         self.ranker.save(self.output_dir)
-        item_stats_df = item_stats_ext.build_feature_df()
-        item_meta_df  = item_meta_ext.build_feature_df()
-        user_stats_df.write_parquet(os.path.join(self.output_dir, "user_stats.parquet"))
-        item_stats_df.write_parquet(os.path.join(self.output_dir, "item_stats.parquet"))
-        item_meta_df.write_parquet(os.path.join(self.output_dir, "item_meta.parquet"))
         log.info(f"  All artefacts saved to {self.output_dir}")
 
         if df_val is not None:
