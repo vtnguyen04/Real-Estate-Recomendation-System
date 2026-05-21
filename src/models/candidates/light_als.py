@@ -115,20 +115,31 @@ class LightALSRecommender(BaseRecommender):
 
     def _pairs_to_csr(self, pairs: pl.DataFrame) -> csr_matrix:
         """Convert a (user_id, item_id, score) DataFrame to a CSR matrix."""
-        valid = [
-            (self._u2i[u], self._i2i[it], float(s))
-            for u, it, s in zip(
-                pairs["user_id"].to_list(),
-                pairs["item_id"].to_list(),
-                pairs["score"].to_list(),
-            )
-            if u in self._u2i and it in self._i2i
-        ]
-        if not valid:
+        # Create mapping DataFrames
+        u_map = pl.DataFrame({
+            "user_id": list(self._u2i.keys()),
+            "u_idx": list(self._u2i.values())
+        })
+        i_map = pl.DataFrame({
+            "item_id": list(self._i2i.keys()),
+            "i_idx": list(self._i2i.values())
+        })
+        
+        # Join pairs with mapping DataFrames to get indices
+        mapped = (
+            pairs
+            .join(u_map, on="user_id", how="inner")
+            .join(i_map, on="item_id", how="inner")
+            .select(["u_idx", "i_idx", "score"])
+        )
+        
+        if len(mapped) == 0:
             return csr_matrix((len(self._u2i), len(self._i2i)), dtype=np.float32)
-        r = np.array([x[0] for x in valid], dtype=np.int32)
-        c = np.array([x[1] for x in valid], dtype=np.int32)
-        v = np.array([x[2] for x in valid], dtype=np.float32)
+            
+        r = mapped["u_idx"].to_numpy().astype(np.int32)
+        c = mapped["i_idx"].to_numpy().astype(np.int32)
+        v = mapped["score"].to_numpy().astype(np.float32)
+        
         return csr_matrix((v, (r, c)), shape=(len(self._u2i), len(self._i2i)))
 
     def rebuild_matrix(self, pairs: pl.DataFrame) -> None:

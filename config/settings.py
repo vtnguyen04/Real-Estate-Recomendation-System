@@ -9,7 +9,6 @@ from typing import Dict, List, Optional, Any
 @dataclass
 class DataConfig:
     """Configuration for data ingestion and processing."""
-    bucket_name: str = "datathon_2026_final"
     train_path: str = "/home/db/rc/datathon/train/"
     test_path: str = "/home/db/rc/datathon/test/"
     cutoff_date: str = "2026-04-09"
@@ -28,41 +27,39 @@ class DataConfig:
 @dataclass
 class ModelConfig:
     """Configuration for candidate generation models."""
-    # Contact ALS
-    als_factors: int = 256
+    # Contact ALS (1024 factors)
+    als_factors: int = 1024
     als_iterations: int = 30
     als_regularization: float = 0.01
     # View ALS
     als_view_factors: int = 64
     als_view_iterations: int = 20
-    # Candidate counts PER USER (INS-025: 85.5% GT items are new → SegPop is PRIMARY)
-    n_cand_als: int = 50         # secondary: only covers 14.5% of GT
-    n_cand_view_als: int = 50    # secondary: browsing signal
-    n_cand_segpop: int = 200     # PRIMARY: city+category popularity is the core signal
-    # Legacy / unused
-    als_contact_weight: float = 5.0
-    als_pageview_min_weight: float = 1.0
-    als_pageview_max_weight: float = 3.0
-    ensemble_weights: Dict[str, float] = field(
-        default_factory=lambda: {"als": 0.9, "popularity": 0.1}
-    )
+    # Candidate counts PER USER (used by legacy EnsembleGen only)
+    n_cand_als: int = 50
+    n_cand_view_als: int = 50
+    n_cand_segpop: int = 200
+    # INS-062: Use weighted contacts for ALS (real=3x, other_interaction=1x)
+    als_use_weighted: bool = True
 
 
 @dataclass
 class RankerConfig:
     """Configuration for the LightGBM lambdarank ranker."""
-    num_leaves: int = 127
-    learning_rate: float = 0.01
-    n_estimators: int = 2000
-    early_stopping_rounds: int = 100
-    feature_fraction: float = 0.8
-    bagging_fraction: float = 0.9
-    bagging_freq: int = 5
-    min_child_samples: int = 20
-    lambdarank_truncation_level: int = 10
+    num_leaves: int = 31           # Was 127 → massive overfit (train 0.988, val 0.106)
+    learning_rate: float = 0.05    # Was 0.01 → with fewer leaves, can learn faster
+    n_estimators: int = 100
+    early_stopping_rounds: int = 50
+    feature_fraction: float = 0.6  # Was 0.8 → more regularization
+    bagging_fraction: float = 0.7  # Was 0.9 → more regularization
+    bagging_freq: int = 3          # Was 5
+    min_child_samples: int = 100   # Was 20 → prevent memorization
+    lambdarank_truncation_level: int = 10  # Depth of NDCG optimization (top-K focus)
     feature_cols: List[str] = field(default_factory=lambda: [
         "score_als", "score_view_als", "score_segpop",
-        "is_from_als", "is_from_view_als", "is_from_segpop",
+        # Cascade source flags (must match CascadeCandidateGenerator.SOURCE_COLS)
+        "is_from_pv", "is_from_intent", "is_from_cocontact",
+        "is_from_als", "is_from_als_view", "is_from_user_knn",
+        "is_from_seller", "is_from_recent_cc", "is_from_segpop",
         "event_count", "contact_rate",
         "item_total_contacts", "item_total_views",
         "item_recent_contacts", "item_recency_score", "item_novelty_score",
@@ -72,11 +69,48 @@ class RankerConfig:
         "item_cat", "item_city",
         "city_match", "cat_match",
         "price_match", "ad_type_match", "listing_age_days",
+        # F-012/F-031: fact_listing_snapshot features
+        "item_avg_views_7d", "item_avg_contacts_7d",
+        "item_conversion_rate", "item_trend_score", "item_is_active",
     ])
-    # Legacy multi-task fields (not used by lambdarank pipeline)
-    contact_weights: List[float] = field(default_factory=lambda: [0.0, 0.8, 0.5, 1.0, 0.9])
-    lgbm_bin_weight: float = 0.7
-    lgbm_multi_weight: float = 0.3
+
+
+@dataclass
+class CascadeConfig:
+    """Configuration for CascadeCandidateGenerator — all source params in one place."""
+    # Per-source window & capacity settings
+    pv_window_days: int = 14
+    pv_max_items_per_user: int = 50
+    cocontact_window_days: int = 30
+    recent_cc_window_days: int = 7
+    recent_cc_max_items_per_segment: int = 200
+    user_history_max_items: int = 20
+    intent_max_items_per_intent: int = 200
+    user_knn_max_neighbors: int = 30
+    seller_max_items_per_seller: int = 50
+    # ALS recommend batch size (n param passed to ALS.recommend_batch)
+    als_recommend_n: int = 100
+    # Per-source budgets: top-10 mode (direct output, precision-focused)
+    budget_top10: Dict[str, int] = field(default_factory=lambda: {
+        "als": 10, "intent": 10, "cocontact": 5,
+        "pv": 3, "user_knn": 3, "seller": 3,
+        "als_view": 0, "recent_cc": 10,
+    })
+    # Per-source budgets: pool mode (reranker input, recall-focused)
+    budget_pool: Dict[str, int] = field(default_factory=lambda: {
+        "pv": 50, "intent": 60, "cocontact": 40,
+        "als": 100, "als_view": 0, "user_knn": 50,
+        "seller": 40, "recent_cc": 80,
+    })
+    # Source priority order
+    source_order_top10: List[str] = field(default_factory=lambda: [
+        "als", "intent", "cocontact", "pv", "user_knn", "seller", "recent_cc", "segpop"
+    ])
+    source_order_pool: List[str] = field(default_factory=lambda: [
+        "pv", "intent", "cocontact", "als", "als_view", "user_knn", "seller", "recent_cc", "segpop"
+    ])
+    # Pool size for hybrid mode (cascade k → LGBM rerank → top 10)
+    hybrid_pool_size: int = 200
 
 
 @dataclass
@@ -96,11 +130,9 @@ class PipelineConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     ranker: RankerConfig = field(default_factory=RankerConfig)
     reranker: RerankerConfig = field(default_factory=RerankerConfig)
-    validation_days: int = 3
+    cascade: CascadeConfig = field(default_factory=CascadeConfig)
+    validation_days: int = 0
     top_k: int = 10
-    top_n_for_rerank: int = 30
-    negative_sample_ratio: int = 3
-    candidate_half_life_days: float = 7.0
     # SegPop POOL sizes — how many items stored per segment
     # INS-027: GT has 28,706 unique items. Old pool of 50/segment covered only 21.6%.
     # Must store 500+ items per (city,category) to actually cover GT items.
@@ -109,19 +141,27 @@ class PipelineConfig:
     segpop_cc_k: int = 500         # per (city, category) — the critical segment
     segpop_ccd_k: int = 100        # per (city, category, district)
     # Training pipeline
-    n_train_users: int = 50_000
+    n_train_users: int = 15_000
     val_sample: int = 2_000
     cand_batch: int = 5_000
     positive_window_days: int = 14
+    # PCI (fact_post_contact_interactions) — INS-059, INS-060
+    pci_enabled: bool = True
+    pci_min_lead_count: int = 1           # Only include rows with lead_count >= this
+    pci_merge_mode: str = "existing_only" # "existing_only" | "all" | "test_only" (INS-058: density > size)
+    pci_purchased_weight: float = 3.0     # Weight multiplier for purchased=True pairs
+    # 4-stage inference mode (Fix 1: train on cascade, infer with LightGBM rerank)
+    inference_mode: str = "cascade"        # "cascade" (Stage 1 only) | "hybrid" (Cascade+LightGBM) | "legacy" (EnsembleGen)
+    # Cache & model paths
+    cache_dir: str = ".cache"
+    model_dir: str = "outputs/models"
 
     def to_dict(self) -> Dict[str, Any]:
         """Flattens the config into a single dictionary."""
         flat_dict = {
             "validation_days": self.validation_days,
             "top_k": self.top_k,
-            "top_n_for_rerank": self.top_n_for_rerank,
-            "negative_sample_ratio": self.negative_sample_ratio,
-            "candidate_half_life_days": self.candidate_half_life_days,
+            "inference_mode": self.inference_mode,
             "segpop_global_k": self.segpop_global_k,
             "segpop_segment_k": self.segpop_segment_k,
             "segpop_cc_k": self.segpop_cc_k,

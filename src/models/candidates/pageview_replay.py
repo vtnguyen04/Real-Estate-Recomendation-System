@@ -87,8 +87,7 @@ class PageviewReplayRecommender:
             for f in filters:
                 scan = scan.filter(f)
 
-        events = scan.select(["user_id", "item_id", "event_ts", "event_type"]).collect()
-        logger.info(f"PageviewReplay: loaded {len(events):,} events ({self.window_days}d window)")
+        events = scan.select(["user_id", "item_id", "event_ts", "event_type"])
 
         # Weight contact events 10x vs pageviews
         events = events.with_columns(
@@ -98,7 +97,7 @@ class PageviewReplayRecommender:
             .alias("weight")
         )
 
-        # Aggregate per (user, item): total weight + last interaction time
+        # Aggregate per (user, item) using streaming to minimize peak RAM
         ranked = (
             events
             .group_by(["user_id", "item_id"])
@@ -110,7 +109,9 @@ class PageviewReplayRecommender:
                 ["user_id", "total_weight", "last_event"],
                 descending=[False, True, True],
             )
+            .collect(streaming=True)
         )
+        logger.info(f"PageviewReplay: aggregated to {len(ranked):,} (user,item) pairs")
 
         # Build per-user lists
         self._user_items = {}
