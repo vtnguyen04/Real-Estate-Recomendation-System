@@ -3,7 +3,7 @@
 > **Cuộc thi**: DATATHON - VÒNG CHUNG KẾT (Chợ Tốt)
 > **Bài toán**: Dự đoán 10 bất động sản (item_id) mà mỗi user sẽ liên hệ (view_phone, contact_chat, contact_zalo, contact_sms) trong giai đoạn test.
 > **Metric**: Recall@10
-> **Best Score**: 0.0344 (v14)
+> **Best Score**: 0.2116 (v17) 🚀
 
 ---
 
@@ -17,8 +17,8 @@
 │   ├── train.py                    # Step 2: Train ALS + SegPop models
 │   ├── inference.py                # Step 3: Generate submission.csv
 │   ├── evaluate.py                 # Offline evaluation (Recall@K, NDCG@K)
+│   ├── evaluate_aligned.py         # Leak-free offline evaluation split
 │   ├── run_gpu.sh                  # GPU launcher (sets LD_LIBRARY_PATH for CUDA)
-│   ├── train_reranker.py           # Train LightGBM reranker (experimental)
 │   └── generate_cold_prefs.py      # Generate cold user preferences from pageviews
 ├── src/
 │   ├── core/
@@ -26,6 +26,7 @@
 │   ├── data/
 │   │   ├── loader.py               # FactUserEventsLoader (streaming parquet)
 │   │   ├── preprocessor.py         # DataPreprocessor (cache builder)
+│   │   ├── pci_loader.py           # PCI (fact_post_contact_interactions) loader
 │   │   └── loaders/
 │   │       └── als_matrix_builder.py
 │   ├── models/
@@ -36,7 +37,7 @@
 │   │   │   ├── cocontact.py        # Co-contact graph recommender
 │   │   │   ├── intent_recommender.py # Intent-based (city+category matching)
 │   │   │   ├── user_knn.py         # User-KNN co-occurrence CF
-│   │   │   ├── seller_recommender.py # Seller expansion
+│   │   │   └── seller_recommender.py # Seller expansion
 │   │   │   ├── item2item.py        # Item co-occurrence (session-based)
 │   │   │   ├── als_recommender.py  # Legacy ALS wrapper
 │   │   │   ├── implicit_base.py    # Implicit base class
@@ -62,7 +63,7 @@
 │   │   └── health_metrics.py       # Coverage, diversity, fairness metrics
 │   ├── pipeline/
 │   │   ├── training_pipeline.py    # End-to-end training orchestrator
-│   │   ├── inference_pipeline.py   # Legacy inference pipeline
+│   │   ├── inference_pipeline.py   # End-to-end inference pipeline
 │   │   └── data_forensics.py       # Data quality checks
 │   ├── utils/
 │   │   ├── logging.py              # Logger setup
@@ -70,20 +71,21 @@
 │   │   ├── plotting.py             # Visualization helpers
 │   │   ├── polars_utils.py         # Polars utilities
 │   │   └── report_writer.py        # Markdown report generator
-│   └── eda/                        # EDA scripts & reports (22 rounds)
+│   └── eda/                        # EDA scripts & reports (24 rounds)
 │       ├── .claude/                # AI agent state tracking
-│       ├── round_01_*.py ... round_17_*.py
+│       ├── round_01_*.py ... round_23_*.py
 │       └── reports/                # Generated EDA reports
+├── validate_submission.py          # Submission validator
 ├── .gitignore
 ├── pyproject.toml
 ├── requirements.txt
 ├── uv.lock
-└── README.md                       # ← This file
+└── README.md                       # ← File này
 ```
 
 ---
 
-## 🚀 Quickstart — Tạo submission (Best Solution v14)
+## 🚀 Quickstart — Tạo submission (Best Solution v17)
 
 ### Prerequisites
 
@@ -152,27 +154,22 @@ Output tại `.cache/`:
 bash scripts/run_gpu.sh train
 ```
 
-> ⚠️ **QUAN TRỌNG**: Training sẽ overwrite `segpop.pkl`. Phải restore recency version sau:
+> ⚠️ **Huấn luyện ở chế độ Cascade**: Ở chế độ `cascade` (chế độ tốt nhất), pipeline tự động bỏ qua ViewALS và LightGBM ranker. Nhờ đó, việc huấn luyện sẽ diễn ra rất nhanh (~7-8 phút) và không lo bị tràn bộ nhớ (OOM). 
+> 
+> Sau khi chạy xong:
 > ```bash
-> # Nếu chưa có segpop_recency.pkl, bỏ qua bước này
+> # Luôn copy đè file segpop_recency.pkl (chứa độ phổ biến theo recency) lên segpop.pkl để có kết quả tốt nhất khi inference
 > cp outputs/models/segpop_recency.pkl outputs/models/segpop.pkl
-> ```
-
-> ⚠️ **OOM WARNING**: ViewALS (step 4/8) sẽ tràn RAM trên máy 32GB.
-> Kill process ngay khi thấy `[4/8] Fitting ViewALS` — ContactALS đã save xong.
-> ```bash
-> # Monitor và kill khi ViewALS bắt đầu:
-> pkill -f "scripts/train.py"
 > ```
 
 Output tại `outputs/models/`:
 | File | Size | Model |
 |------|------|-------|
-| `als/als.npz` | 1.5GB | ALS user/item factors (256 dims) |
-| `als/als_matrix.npz` | 84MB | Sparse interaction matrix |
-| `als/als_meta.pkl` | 262MB | User/item ID mappings |
+| `als/als.npz` | 5.8GB | ALS user/item factors (1024 dims) |
+| `als/als_matrix.npz` | 49MB | Sparse interaction matrix |
+| `als/als_meta.pkl` | 110MB | User/item ID mappings |
 | `segpop_trained.pkl` | 6MB | Alltime SegPop (KHÔNG dùng) |
-| `segpop.pkl` | 4.4MB | ⭐ Recency SegPop (dùng cho inference) |
+| `segpop.pkl` | 4.3MB | ⭐ Recency SegPop (dùng cho inference) |
 
 ### 5. Step 3 — Inference (Generate Submission)
 
@@ -201,12 +198,12 @@ print('✅ Valid')
 uv run kaggle competitions submit \
   -c datathon-chung-ket \
   -f submission.csv \
-  -m "v14: ALS 256f + recency SegPop + cascade"
+  -m "v17: ALS 1024f + recency SegPop + cascade"
 ```
 
 ---
 
-## 🏗️ Solution Architecture (v14 — Best: 0.0344)
+## 🏗️ Solution Architecture (v17 — Best: 0.2116)
 
 ### Pipeline Overview
 
@@ -217,7 +214,7 @@ fact_user_events (41GB, 161M rows)
   .cache/ (login-only contacts, pageviews, sessions)
        │
        ▼ [train.py]
-  ContactALS (256 factors, 30 iterations, GPU)
+  ContactALS (1024 factors, 30 iterations, GPU)
   + SegPop (recency-weighted popularity by city+category)
        │
        ▼ [inference.py]
@@ -233,9 +230,9 @@ fact_user_events (41GB, 161M rows)
 
 | Segment | Count | % | Strategy |
 |---------|-------|---|----------|
-| **Warm** (có contact history) | 54,502 | 33.7% | ALS → Intent → cascade |
-| **Cold** (có pageview prefs) | 3,651 | 2.3% | Intent → SegPop (city+cat) |
-| **Blind** (zero data) | 103,415 | 64.0% | SegPop (hash-based segment) |
+| **Warm** (có contact history) | 52,329 | 32.4% | ALS → Intent → cascade |
+| **Cold** (có pageview/PCI prefs) | 14,343 | 8.9% | Intent → SegPop (city+cat) |
+| **Blind** (zero data) | 94,896 | 58.7% | SegPop (hash-based segment) |
 
 ### Candidate Sources
 
@@ -263,13 +260,9 @@ fact_user_events (41GB, 161M rows)
 
 | Version | Score | Key Changes | Status |
 |---------|-------|-------------|--------|
-| v5 | 0.0003 | Cascade V5 (glob bug) | ❌ |
-| v6 | 0.0004 | Fix items, all users | ❌ |
 | v10 | 0.0340 | ALS 256f + recency SegPop | ✅ |
-| v11 | 0.0048 | + LightGBM reranker (wrong segpop bug) | ❌ |
-| v12 | 0.0050 | + offset diversity (wrong segpop) | ❌ |
-| v13 | 0.0140 | Remove is_login filter (noise dilution) | ❌ |
-| **v14** | **0.0344** | Rollback + clean ALS retrain | ✅ BEST |
+| v14 | 0.0344 | Rollback + clean ALS 256f retrain | ✅ |
+| **v17** | **0.2116** | **ALS 1024f (full data train) + Recency SegPop + Cascade Direct (ID hoa)** | ✅ BEST |
 
 ---
 
@@ -277,13 +270,13 @@ fact_user_events (41GB, 161M rows)
 
 1. **85.5% GT items are NEW to user** — CF is secondary, content-based is critical
 2. **91.9% GT items match user's city** — Location-first recommendation
-3. **64% test users are completely blind** — Zero training data, cold-start is #1 challenge
+3. **58.7% test users are completely blind** — Zero training data, cold-start is #1 challenge
 4. **ALS density > size** — 16.1 contacts/user (login) > 7.5 (all users). Quality > quantity
 5. **Recency > alltime popularity** — 50.3% contacts on items ≤7 days old
-6. **SegPop city bug cost 96K users** — String mismatch between train/dim_listing
+6. **PCI (Post Contact Interactions) is high-value signal** — Integrating post-contact events with a 3x weight multiplier for purchases helps bridge the gap for Cold users who have pageviews/PCI preferences but no login contacts.
 7. **Budget sequential union > round-robin** — Priority cascade +33% Recall@200
 8. **als_view (pageview CF) = noise** — Disabling improves Recall@200 +5.4%
-9. **Offline eval ≠ leaderboard** — Offline only measures warm users (33.7%)
+9. **LightGBM overfits to Warm users** — Training LGBM on candidates drops Cold/Blind user Recall by 75.9%. Bypassing LGBM for direct Cascade inference yields +400% score increase on Public LB.
 10. **is_login filter = quality gate** — Non-login events destroy ALS embeddings
 
 ---
@@ -294,7 +287,7 @@ Key settings in `config/settings.py`:
 
 ```python
 # ALS
-als_factors = 256
+als_factors = 1024
 als_iterations = 30
 als_regularization = 0.01
 
@@ -309,7 +302,7 @@ n_cand_segpop = 200      # SegPop candidates per user
 top_k = 10               # Final recommendations per user
 
 # Validation
-validation_days = 3      # Temporal split for offline eval
+validation_days = 0      # Temporal split for offline eval (0 = train on full dataset)
 ```
 
 ---
