@@ -59,12 +59,14 @@ def predict_users_cascade(
     users: list,
     contacts: pl.DataFrame,
     split_date,
+    config: "PipelineConfig",
     data_dir: str,
     model_dir: str,
     prefs_dict: dict,
     df_listing: pl.DataFrame,
+    hybrid: bool = False,
 ) -> dict[str, list]:
-    """Cascade predict: ALS → Intent → PV → UserKNN → CoContact → Seller → RecentCC → SegPop."""
+    """Cascade predict aligned with production InferencePipeline flow."""
     from src.models.candidates.pageview_replay import PageviewReplayRecommender
     from src.models.candidates.cocontact import CoContactRecommender
     from src.models.candidates.segment_popularity import SegmentPopularityRecommender
@@ -73,73 +75,163 @@ def predict_users_cascade(
     from src.models.candidates.seller_recommender import SellerExpansionRecommender
     from src.models.ensemble.cascade_generator import CascadeCandidateGenerator
 
+    cc = config.cascade
     user_set = set(users)
     train_contacts = contacts.filter(pl.col("last_date") <= split_date)
     valid_items = set(df_listing["item_id"].to_list())
 
-    pv_replay = PageviewReplayRecommender(window_days=14, max_items_per_user=50)
     events_path = os.path.join(data_dir, "fact_user_events/*.parquet")
+
+    # PageviewReplay — use config window
+    pv_replay = PageviewReplayRecommender(
+        window_days=cc.pv_window_days, max_items_per_user=cc.pv_max_items_per_user,
+    )
     pv_replay.fit(events_path, user_ids=user_set, cutoff_date=split_date)
 
-    cocontact = CoContactRecommender(window_days=30)
+    # CoContact
+    cocontact = CoContactRecommender(window_days=cc.cocontact_window_days)
     cocontact.fit(train_contacts, cutoff_date=split_date)
 
+    # RecentCC
     recent_cc = CascadeCandidateGenerator.build_recent_cc(
-        train_contacts, cutoff_date=split_date, window_days=7,
+        train_contacts, cutoff_date=split_date, window_days=cc.recent_cc_window_days,
     )
 
+    # SegPop
     segpop = SegmentPopularityRecommender().load(os.path.join(model_dir, "segpop.pkl"))
 
+    # ContactALS
     from src.models.candidates.light_als import LightALSRecommender
     als = LightALSRecommender()
     als.load(os.path.join(model_dir, "als"))
     if als._matrix is None:
-        als_contacts = pl.read_parquet(os.path.join(CACHE_DIR, "als_contact_pairs.parquet"))
+        als_rebuild_file = "als_weighted_contact.parquet" if config.model.als_use_weighted else "als_contact_pairs.parquet"
+        als_rebuild_path = os.path.join(CACHE_DIR, als_rebuild_file)
+        if not os.path.exists(als_rebuild_path):
+            als_rebuild_path = os.path.join(CACHE_DIR, "als_contact_pairs.parquet")
+        als_contacts = pl.read_parquet(als_rebuild_path)
         als.rebuild_matrix(als_contacts)
 
-    als_view = LightALSRecommender()
-    als_view.load(os.path.join(model_dir, "als_view"))
-    if als_view._matrix is None:
-        pv_data = pl.read_parquet(os.path.join(CACHE_DIR, "als_pageview_pairs.parquet"))
-        als_view.rebuild_matrix(pv_data.select(["user_id", "item_id", "view_count"])
-                                 .rename({"view_count": "score"}))
+    # ViewALS — only if budget > 0
+    als_view = None
+    has_view_budget = (
+        cc.budget_pool.get("als_view", 0) > 0
+        or cc.budget_top10.get("als_view", 0) > 0
+    )
+    als_view_path = os.path.join(model_dir, "als_view")
+    if has_view_budget and os.path.isdir(als_view_path):
+        als_view = LightALSRecommender()
+        als_view.load(als_view_path)
+        if als_view._matrix is None:
+            pv_data = pl.read_parquet(os.path.join(CACHE_DIR, "als_pageview_pairs.parquet"))
+            als_view.rebuild_matrix(pv_data)
+        logger.info("  ALS View loaded (budget > 0).")
+    else:
+        logger.info("  ALS View skipped (budget=0 or no artifact).")
 
+    # User histories
     user_histories = CascadeCandidateGenerator.build_user_histories(
-        train_contacts, user_ids=user_set, max_items=20,
+        train_contacts, user_ids=user_set, max_items=cc.user_history_max_items,
     )
 
-    intent_rec = IntentRecommender(max_items_per_intent=200)
+    # Intent
+    intent_rec = IntentRecommender(max_items_per_intent=cc.intent_max_items_per_intent)
     pvs_lazy = pl.scan_parquet(events_path).filter(
-        (pl.col("event_ts") <= split_date) & 
-        (pl.col("event_ts") >= split_date - pl.duration(days=14)) &
+        (pl.col("event_ts") <= split_date) &
+        (pl.col("event_ts") >= split_date - pl.duration(days=cc.pv_window_days)) &
         (pl.col("event_type") == "pageview")
     ).select(["user_id", "item_id"]).collect()
     intent_rec.fit(pvs=pvs_lazy, dim_listing=df_listing, valid_items=valid_items)
 
-    # UserKNN (Recall@200=0.0862)
-    user_knn = UserKNNRecommender(max_neighbors_per_item=30)
+    # UserKNN
+    user_knn = UserKNNRecommender(max_neighbors_per_item=cc.user_knn_max_neighbors)
     user_knn.fit(train_contacts.lazy(), query_user_ids=user_set, valid_items=valid_items)
 
-    # SellerExpansion (Recall@200=0.0302)
-    seller_rec = SellerExpansionRecommender(max_items_per_seller=50)
+    # SellerExpansion
+    seller_rec = SellerExpansionRecommender(max_items_per_seller=cc.seller_max_items_per_seller)
     seller_rec.fit(train_contacts.lazy(), listing_df=df_listing, query_user_ids=user_set)
 
-    # Extract item-to-city mapping
+    # Item cities
     item_cities = dict(zip(df_listing["item_id"], df_listing["city_name"]))
 
     cascade = CascadeCandidateGenerator(
         pv_replay=pv_replay, cocontact=cocontact, segpop=segpop,
         als=als, als_view=als_view,
         recent_cc=recent_cc, user_histories=user_histories,
-        intent_rec=intent_rec,
-        user_knn=user_knn,
-        seller_rec=seller_rec,
-        item_cities=item_cities,
+        intent_rec=intent_rec, user_knn=user_knn,
+        seller_rec=seller_rec, item_cities=item_cities,
+        cascade_cfg=cc,
     )
 
-    return cascade.generate_batch(
-        user_ids=users, user_prefs=prefs_dict, k=200, valid_items=valid_items,
-    )
+    if hybrid:
+        # Hybrid mode: cascade k=pool → LGBM rerank → top 10
+        # Mirrors production _rerank_batch_df() exactly
+        from src.models.rankers.lgbm_ranker import LambdarankLGBMRanker
+        from src.features.feature_engineer import FeatureEngineer
+        from src.features.extractors.preference_match import PreferenceMatchExtractor
+        from src.features.extractors.item_snapshot import ItemSnapshotExtractor
+
+        ranker = LambdarankLGBMRanker()
+        ranker.load(model_dir)
+        user_stats_df = pl.read_parquet(os.path.join(model_dir, "user_stats.parquet"))
+        item_stats_df = pl.read_parquet(os.path.join(model_dir, "item_stats.parquet"))
+        item_meta_df  = pl.read_parquet(os.path.join(model_dir, "item_meta.parquet"))
+
+        snapshot_path = os.path.join(model_dir, "snapshot_stats.parquet")
+        snapshot_stats_df = None
+        if os.path.exists(snapshot_path):
+            snapshot_stats_df = pl.read_parquet(snapshot_path)
+
+        snapshot_ext = ItemSnapshotExtractor(snapshot_path)
+        feature_eng = FeatureEngineer(extractors=[
+            PreferenceMatchExtractor(), snapshot_ext,
+        ])
+        logger.info(f"  Hybrid mode: ranker with {len(ranker.feature_cols)} features")
+
+        user_recs: dict[str, list] = {}
+        batch_size = 2_000
+        for start_idx in range(0, len(users), batch_size):
+            batch = users[start_idx:start_idx + batch_size]
+            df_batch = cascade.generate_batch_with_sources(
+                user_ids=batch, user_prefs=prefs_dict,
+                k=cc.hybrid_pool_size, valid_items=valid_items,
+            )
+            if len(df_batch) == 0:
+                continue
+
+            # Ensure score_segpop exists
+            if "score_segpop" not in df_batch.columns:
+                df_batch = df_batch.with_columns(pl.lit(0.0).alias("score_segpop"))
+
+            # Feature tables
+            df_batch = feature_eng.attach_features_inference(
+                df_batch, user_stats_df, item_stats_df, item_meta_df,
+            )
+
+            # Join snapshot features (same as production)
+            if snapshot_stats_df is not None:
+                df_batch = df_batch.join(snapshot_stats_df, on="item_id", how="left")
+
+            # Fill missing feature cols with 0 (same as production)
+            for fc in ranker.feature_cols:
+                if fc not in df_batch.columns:
+                    df_batch = df_batch.with_columns(pl.lit(0.0).alias(fc))
+
+            # Score + rank (use full df, not subset)
+            scores = ranker.predict(df_batch)
+            df_batch = df_batch.with_columns(pl.Series("lgbm_score", scores.tolist()))
+            top10 = (
+                df_batch.sort(["user_id", "lgbm_score"], descending=[False, True])
+                .group_by("user_id", maintain_order=True).head(10)
+            )
+            for r in top10.select(["user_id", "item_id"]).iter_rows():
+                user_recs.setdefault(r[0], []).append(r[1])
+        return user_recs
+    else:
+        # Direct cascade top-10
+        return cascade.generate_batch(
+            user_ids=users, user_prefs=prefs_dict, k=10, valid_items=valid_items,
+        )
 
 
 def main():
@@ -151,6 +243,8 @@ def main():
                         help="Number of val users to sample (0 = all)")
     parser.add_argument("--cascade", action="store_true",
                         help="Use cascade pipeline instead of legacy")
+    parser.add_argument("--hybrid", action="store_true",
+                        help="Cascade + LGBM rerank (requires --cascade)")
     args = parser.parse_args()
 
     t0 = time.time()
@@ -221,8 +315,10 @@ def main():
     if args.cascade:
         user_recs = predict_users_cascade(
             val_users, contacts, split_date,
+            config=config,
             data_dir=args.data_dir, model_dir=args.model_dir,
             prefs_dict=prefs_dict, df_listing=df_listing,
+            hybrid=args.hybrid,
         )
     else:
         # Legacy mode: load ALS + LightGBM + Reranker
@@ -242,12 +338,18 @@ def main():
         if als._matrix is None:
             als_contacts = pl.read_parquet(os.path.join(CACHE_DIR, "als_contact_pairs.parquet"))
             als.rebuild_matrix(als_contacts)
-        als_view = LightALSRecommender()
-        als_view.load(os.path.join(args.model_dir, "als_view"))
-        if als_view._matrix is None:
-            pv_data = pl.read_parquet(os.path.join(CACHE_DIR, "als_pageview_pairs.parquet"))
-            als_view.rebuild_matrix(pv_data.select(["user_id", "item_id", "view_count"])
-                                     .rename({"view_count": "score"}))
+        als_view = None
+        als_view_path = os.path.join(args.model_dir, "als_view")
+        if os.path.isdir(als_view_path):
+            als_view = LightALSRecommender()
+            als_view.load(als_view_path)
+            if als_view._matrix is None:
+                pv_path = os.path.join(CACHE_DIR, "als_pageview_pairs.parquet")
+                if os.path.exists(pv_path):
+                    pv_data = pl.read_parquet(pv_path)
+                    als_view.rebuild_matrix(pv_data)
+        else:
+            logger.info("  als_view artifact not found, skipping.")
         ranker = LambdarankLGBMRanker()
         ranker.load(args.model_dir)
         logger.info(f"  Loaded ranker with {len(ranker.feature_cols)} feature cols")
