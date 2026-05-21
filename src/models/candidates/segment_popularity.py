@@ -15,6 +15,7 @@ Cascade: (city+cat+district) → (city+cat) → (city) → (cat) → global
 from __future__ import annotations
 
 from collections import defaultdict
+import hashlib
 from typing import List, Dict, Tuple, Optional, Set, Any
 
 import polars as pl
@@ -26,6 +27,13 @@ logger = get_logger(__name__)
 
 # Competition ground truth events
 GT_EVENTS = ['view_phone', 'contact_chat', 'other_interaction', 'contact_zalo', 'contact_sms']
+
+
+def _stable_hash_int(value: Optional[str]) -> int:
+    """Stable process-independent hash for deterministic user diversification."""
+    if not value:
+        return 0
+    return int(hashlib.md5(value.encode("utf-8")).hexdigest()[:8], 16)
 
 
 class SegmentPopularityRecommender(BaseRecommender):
@@ -63,6 +71,7 @@ class SegmentPopularityRecommender(BaseRecommender):
         self._cat: Dict[int, List[str]] = defaultdict(list)
         self._cc: Dict[Tuple[str, int], List[str]] = defaultdict(list)
         self._ccd: Dict[Tuple[str, int, str], List[str]] = defaultdict(list)
+        self._blind_global: List[str] = []
 
     def fit(
         self,
@@ -263,6 +272,52 @@ class SegmentPopularityRecommender(BaseRecommender):
         )
         return self
 
+    def set_blind_global_from_snapshot(
+        self,
+        snapshot_df: pl.DataFrame,
+        valid_items: Optional[Set[str]] = None,
+        top_k: int = 500,
+    ) -> "SegmentPopularityRecommender":
+        """
+        Set no-preference blind fallback from item-side snapshot demand.
+
+        This is only used when a user has no city/category preference. In that
+        case user-side personalization is unavailable, so recent marketplace
+        demand is a stronger prior than hash-diversified historical contacts.
+        Supports either raw fact_listing_snapshot columns or cached
+        snapshot_stats.parquet columns.
+        """
+        valid_set = valid_items if valid_items else None
+        df = snapshot_df
+        if valid_set:
+            df = df.filter(pl.col("item_id").is_in(list(valid_set)))
+
+        cols = set(df.columns)
+        if {"views_24h", "contacts_24h"}.issubset(cols):
+            scored = (
+                df.group_by("item_id")
+                .agg([
+                    pl.col("views_24h").sum().alias("views"),
+                    pl.col("contacts_24h").sum().alias("contacts"),
+                ])
+                .with_columns((pl.col("contacts") * 20 + pl.col("views")).alias("score"))
+            )
+        elif {"item_avg_views_7d", "item_avg_contacts_7d"}.issubset(cols):
+            scored = df.with_columns(
+                (pl.col("item_avg_contacts_7d").fill_null(0) * 20
+                 + pl.col("item_avg_views_7d").fill_null(0)).alias("score")
+            )
+        else:
+            logger.warning("Snapshot blind fallback skipped: unsupported snapshot schema")
+            return self
+
+        self._blind_global = (
+            scored.sort("score", descending=True)
+            .head(top_k)["item_id"].to_list()
+        )
+        logger.info(f"Blind snapshot fallback set: {len(self._blind_global):,} items")
+        return self
+
     def recommend(
         self,
         context: RecommendationContext,
@@ -303,12 +358,17 @@ class SegmentPopularityRecommender(BaseRecommender):
         if len(recs) < k and pref_cat:
             _fill(self._cat.get(pref_cat, []))
             
-        # INS-032: Cold-Start Fallback -> Force HCM/HN and 1010/1020
+        # INS-064/H-024: Proportional cold-start fallback
         if len(recs) < k and not pref_city and not pref_cat:
-            _fill(self._cc.get(("Hồ Chí Minh", 1010), []))
-            _fill(self._cc.get(("Hồ Chí Minh", 1020), []))
-            _fill(self._cc.get(("Hà Nội", 1010), []))
-            _fill(self._cc.get(("Hà Nội", 1020), []))
+            _weighted = [
+                ("Tp Hồ Chí Minh", 1050), ("Tp Hồ Chí Minh", 1020),
+                ("Tp Hồ Chí Minh", 1010), ("Đà Nẵng", 1020),
+                ("Hà Nội", 1020), ("Tp Hồ Chí Minh", 1040),
+            ]
+            for seg in _weighted:
+                if len(recs) >= k:
+                    break
+                _fill(self._cc.get(seg, []))
 
         _fill(self._global)
 
@@ -346,43 +406,50 @@ class SegmentPopularityRecommender(BaseRecommender):
         if len(recs) < k and pref_cat:
             _fill(self._cat.get(pref_cat, []))
             
-        # INS-032: Cold-Start Fallback → distribute blind users across top segments
-        # using hash of user_id for deterministic but diverse assignment
+        # INS-064/H-024 + INS-054: Proportional blind allocation based on blind
+        # contact distribution, but keep the item set fixed. Previous hash-offset
+        # diversity changed the candidate set and hurt relevance; for no-signal
+        # users, the best prior should be shared. We rotate only final order so
+        # rank-1 exposure is not concentrated while Recall@10 is preserved.
+        # Blind users: 1050=39.6%, 1020=30.5%, 1010=15.9%, 1040=7.8%, 1030=6.2%; HCM=73.8%
         if len(recs) < k and not pref_city and not pref_cat:
-            # Top segments by contact volume (covers ~95% of all contacts)
-            _top_segments = [
-                ("Tp Hồ Chí Minh", 1020),  # 41.8%
-                ("Tp Hồ Chí Minh", 1050),  # 18.0%
-                ("Tp Hồ Chí Minh", 1010),  # 13.6%
-                ("Tp Hồ Chí Minh", 1030),  #  4.3%
-                ("Tp Hồ Chí Minh", 1040),  #  2.4%
-                ("Đà Nẵng", 1020),          #  2.0%
-                ("Hà Nội", 1020),           #  1.8%
-                ("Bình Dương", 1020),        #  1.3%
-                ("Đà Nẵng", 1040),          #  1.1%
-                ("Đà Nẵng", 1010),          #  0.9%
-                ("Hà Nội", 1010),           #  0.9%
-                ("Hà Nội", 1050),           #  0.9%
+            if self._blind_global:
+                _fill(self._blind_global)
+            remaining = k - len(recs)
+            _weighted_segments = [
+                # (segment, fraction of blind contacts)
+                (("Tp Hồ Chí Minh", 1050), 0.293),  # HCM × 1050 = 39.6% × 0.74
+                (("Tp Hồ Chí Minh", 1020), 0.225),  # HCM × 1020 = 30.5% × 0.74
+                (("Tp Hồ Chí Minh", 1010), 0.117),  # HCM × 1010 = 15.9% × 0.74
+                (("Tp Hồ Chí Minh", 1040), 0.058),  # HCM × 1040
+                (("Tp Hồ Chí Minh", 1030), 0.046),  # HCM × 1030
+                (("Đà Nẵng", 1020),         0.048),  # Đà Nẵng (6.5%)
+                (("Hà Nội", 1020),          0.047),  # Hà Nội (6.4%)
+                (("Bình Dương", 1020),       0.020),  # Bình Dương
+                (("Đà Nẵng", 1050),         0.020),
+                (("Hà Nội", 1050),          0.020),
             ]
-            # Use hash to assign each blind user to a different segment
-            if user_id:
-                seg_idx = hash(user_id) % len(_top_segments)
-                primary_seg = _top_segments[seg_idx]
-                _fill(self._cc.get(primary_seg, []))
-                # Also fill from neighboring segments for diversity
-                for offset in [1, 2, 3]:
-                    if len(recs) >= k:
+            slot_alloc = []
+            for seg, frac in _weighted_segments:
+                n_slots = max(1, round(frac * remaining))
+                slot_alloc.append((seg, n_slots))
+
+            for seg, n_slots in slot_alloc:
+                if len(recs) >= k:
+                    break
+                pool = self._cc.get(seg, [])
+                taken = 0
+                for item in pool:
+                    if len(recs) >= k or taken >= n_slots:
                         break
-                    next_seg = _top_segments[(seg_idx + offset) % len(_top_segments)]
-                    _fill(self._cc.get(next_seg, []))
-            else:
-                # No user context, use all top segments
-                for seg in _top_segments:
-                    if len(recs) >= k:
-                        break
-                    _fill(self._cc.get(seg, []))
-            
+                    if item not in seen:
+                        recs.append(item); seen.add(item)
+                        taken += 1
+
         _fill(self._global)
+        if user_id and not pref_city and not pref_cat and len(recs) > 1:
+            shift = _stable_hash_int(user_id) % min(len(recs), k)
+            recs = recs[shift:] + recs[:shift]
         return recs
 
     def save(self, path: str) -> None:
@@ -390,17 +457,23 @@ class SegmentPopularityRecommender(BaseRecommender):
         with open(path, "wb") as f:
             pickle.dump(
                 (self._global, dict(self._city), dict(self._cat),
-                 dict(self._cc), dict(self._ccd)),
+                 dict(self._cc), dict(self._ccd), self._blind_global),
                 f,
             )
 
     def load(self, path: str) -> "SegmentPopularityRecommender":
         import pickle
         with open(path, "rb") as f:
-            g, ci, ca, cc, ccd = pickle.load(f)
+            data = pickle.load(f)
+            if len(data) == 5:
+                g, ci, ca, cc, ccd = data
+                blind_global = []
+            else:
+                g, ci, ca, cc, ccd, blind_global = data
             self._global = g
             self._city = defaultdict(list, ci)
             self._cat = defaultdict(list, ca)
             self._cc = defaultdict(list, cc)
             self._ccd = defaultdict(list, ccd)
+            self._blind_global = blind_global
         return self

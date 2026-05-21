@@ -55,9 +55,9 @@ class CascadeCandidateGenerator:
 
     def __init__(
         self,
-        pv_replay: PageviewReplayRecommender,
-        cocontact: CoContactRecommender,
-        segpop: SegmentPopularityRecommender,
+        pv_replay: Optional[PageviewReplayRecommender] = None,
+        cocontact: Optional[CoContactRecommender] = None,
+        segpop: Optional[SegmentPopularityRecommender] = None,
         als: Optional[LightALSRecommender] = None,
         als_view: Optional[LightALSRecommender] = None,
         recent_cc: Optional[Dict[Tuple[str, int], List[str]]] = None,
@@ -66,6 +66,7 @@ class CascadeCandidateGenerator:
         user_knn: Optional[UserKNNRecommender] = None,
         seller_rec: Optional[SellerExpansionRecommender] = None,
         item_cities: Optional[Dict[str, str]] = None,
+        cascade_cfg=None,
     ):
         """
         Args:
@@ -80,7 +81,14 @@ class CascadeCandidateGenerator:
             user_knn: UserKNNRecommender (priority 4).
             seller_rec: SellerExpansionRecommender (priority 6).
             item_cities: Mapping from item_id to city_name.
+            cascade_cfg: CascadeConfig with budgets and source orders. Falls back to defaults.
         """
+        # Lazy import to avoid circular dependency
+        if cascade_cfg is None:
+            from config.settings import CascadeConfig
+            cascade_cfg = CascadeConfig()
+        self._cfg = cascade_cfg
+
         self._pv_replay = pv_replay
         self._cocontact = cocontact
         self._segpop = segpop
@@ -109,25 +117,11 @@ class CascadeCandidateGenerator:
         items: List[str] = []
 
         if k <= 10:
-            # Top-10 mode: ALS-dominant for maximum precision
-            # ALS was best leaderboard source (0.006). Give it full budget.
-            # Other sources fill remaining slots only if ALS can't.
-            budgets = {
-                "als": 10, "intent": 10, "cocontact": 5,
-                "pv": 3, "user_knn": 3, "seller": 3,
-                "als_view": 0, "recent_cc": 10,
-            }
-            # Priority: ALS → Intent → CoContact → PV → UserKNN → Seller → RecentCC → SegPop
-            source_order = ["als", "intent", "cocontact", "pv", "user_knn", "seller", "recent_cc", "segpop"]
+            budgets = self._cfg.budget_top10
+            source_order = self._cfg.source_order_top10
         else:
-            # Pool mode: balanced budgets for recall ceiling
-            budgets = {
-                "pv": 50, "intent": 60, "cocontact": 40,
-                "als": 100, "als_view": 0, "user_knn": 50,
-                "seller": 40, "recent_cc": 80,
-            }
-            # Priority: PV → Intent → CoContact → ALS → ALS_View → UserKNN → Seller → RecentCC → SegPop
-            source_order = ["pv", "intent", "cocontact", "als", "als_view", "user_knn", "seller", "recent_cc", "segpop"]
+            budgets = self._cfg.budget_pool
+            source_order = self._cfg.source_order_pool
 
         # Collect candidates from each source
         for source in source_order:
@@ -230,14 +224,14 @@ class CascadeCandidateGenerator:
         k<=10: ALS-first precision mode. k>10: balanced recall mode.
         """
         # Precompute ALS and ALS View for the batch if available
-        als_n = 10 if k <= 10 else 100
+        als_n = 10 if k <= 10 else self._cfg.als_recommend_n
         als_recs_batch = {}
         if self._als is not None:
             als_recs_batch = self._als.recommend_batch(user_ids, n=als_n, filter_already_liked=False, return_scores=False, valid_items=valid_items)
         
         als_view_recs_batch = {}
         if self._als_view is not None and k > 10:
-            als_view_recs_batch = self._als_view.recommend_batch(user_ids, n=100, filter_already_liked=False, return_scores=False, valid_items=valid_items)
+            als_view_recs_batch = self._als_view.recommend_batch(user_ids, n=self._cfg.als_recommend_n, filter_already_liked=False, return_scores=False, valid_items=valid_items)
 
         results = {}
         stats = {
@@ -246,19 +240,11 @@ class CascadeCandidateGenerator:
         }
 
         if k <= 10:
-            budgets = {
-                "als": 10, "intent": 10, "cocontact": 5,
-                "pv": 3, "user_knn": 3, "seller": 3,
-                "als_view": 0, "recent_cc": 10,
-            }
-            source_order = ["als", "intent", "cocontact", "pv", "user_knn", "seller", "recent_cc", "segpop"]
+            budgets = self._cfg.budget_top10
+            source_order = self._cfg.source_order_top10
         else:
-            budgets = {
-                "pv": 50, "intent": 60, "cocontact": 40,
-                "als": 100, "als_view": 0, "user_knn": 50,
-                "seller": 40, "recent_cc": 80,
-            }
-            source_order = ["pv", "intent", "cocontact", "als", "als_view", "user_knn", "seller", "recent_cc", "segpop"]
+            budgets = self._cfg.budget_pool
+            source_order = self._cfg.source_order_pool
 
         for uid in user_ids:
             pref_city, pref_cat = user_prefs.get(uid, (None, None))
@@ -356,6 +342,154 @@ class CascadeCandidateGenerator:
             f"UserKNN={stats['user_knn']}, CoContact={stats['cocontact']}, Seller={stats['seller']}, "
             f"RecentCC={stats['recent_cc']}, SegPop={stats['segpop']}"
         )
+        return results
+
+    def generate_batch_with_sources(
+        self,
+        user_ids: List[str],
+        user_prefs: Dict[str, Tuple[Optional[str], Optional[int]]],
+        k: int = 200,
+        valid_items: Optional[Set[str]] = None,
+        pos_set: Optional[Dict[str, set]] = None,
+        label_col: bool = True,
+    ) -> pl.DataFrame:
+        """
+        Generate candidates WITH source tracking — for LightGBM training.
+
+        Returns DataFrame with columns:
+            user_id, item_id, source,
+            is_from_pv, is_from_intent, is_from_cocontact, is_from_als,
+            is_from_user_knn, is_from_seller, is_from_recent_cc, is_from_segpop,
+            label (if label_col=True and pos_set provided)
+        """
+        SOURCE_COLS = ["pv", "intent", "cocontact", "als", "als_view",
+                       "user_knn", "seller", "recent_cc", "segpop"]
+
+        # Pre-batch ALS
+        als_recs_batch = {}
+        if self._als is not None:
+            als_recs_batch = self._als.recommend_batch(
+                user_ids, n=self._cfg.als_recommend_n, filter_already_liked=False,
+                return_scores=True, valid_items=valid_items,
+            )
+        als_view_recs_batch = {}
+        als_view_budget = (
+            self._cfg.budget_pool.get("als_view", 0)
+            + self._cfg.budget_top10.get("als_view", 0)
+        )
+        if self._als_view is not None and als_view_budget > 0:
+            als_view_recs_batch = self._als_view.recommend_batch(
+                user_ids, n=self._cfg.als_recommend_n, filter_already_liked=False,
+                return_scores=True, valid_items=valid_items,
+            )
+
+        budgets = self._cfg.budget_pool
+        source_order = self._cfg.source_order_pool
+
+        rows = []
+        for uid in user_ids:
+            pref_city, pref_cat = user_prefs.get(uid, (None, None))
+            seen: Set[str] = set()
+            user_rows: List[dict] = []
+
+            for source in source_order:
+                if len(user_rows) >= k:
+                    break
+                budget = budgets.get(source, k - len(user_rows))
+                if budget <= 0:
+                    continue
+
+                source_items = self._get_source_items(
+                    source, uid, budget, seen, valid_items,
+                    als_recs_batch, als_view_recs_batch,
+                    pref_city, pref_cat,
+                )
+                for it, score in source_items:
+                    if it not in seen and (valid_items is None or it in valid_items):
+                        row = {"user_id": uid, "item_id": it, "source": source}
+                        for sc in SOURCE_COLS:
+                            row[f"is_from_{sc}"] = 1.0 if sc == source else 0.0
+                        if source in ("als", "als_view"):
+                            row["score_als"] = score if source == "als" else 0.0
+                            row["score_view_als"] = score if source == "als_view" else 0.0
+                        else:
+                            row["score_als"] = 0.0
+                            row["score_view_als"] = 0.0
+                        row["score_segpop"] = 0.0  # SegPop has no numeric score
+                        seen.add(it)
+                        user_rows.append(row)
+                        if len(user_rows) >= k:
+                            break
+
+            # Add labels if requested
+            if label_col and pos_set:
+                gt = pos_set.get(uid, set())
+                for row in user_rows:
+                    row["label"] = 1 if row["item_id"] in gt else 0
+
+            rows.extend(user_rows)
+
+        df = pl.DataFrame(rows)
+        logger.info(f"Cascade candidates with sources: {len(df):,} pairs, {df['user_id'].n_unique():,} users")
+        return df
+
+    def _get_source_items(
+        self, source: str, uid: str, budget: int, seen: Set[str],
+        valid_items, als_recs_batch, als_view_recs_batch,
+        pref_city, pref_cat,
+    ) -> List[Tuple[str, float]]:
+        """Get (item_id, score) pairs from a single source."""
+        results = []
+        if source == "pv" and self._pv_replay:
+            for it in self._pv_replay.recommend(uid, k=budget):
+                results.append((it, 0.0))
+        elif source == "intent" and self._intent_rec:
+            for it in self._intent_rec.recommend(uid, k=budget, exclude=set(seen)):
+                results.append((it, 0.0))
+        elif source == "cocontact" and self._cocontact:
+            history = self._user_histories.get(uid, [])
+            if history:
+                for it in self._cocontact.recommend(seed_items=history, k=budget, exclude=set(seen)):
+                    results.append((it, 0.0))
+        elif source == "als" and uid in als_recs_batch:
+            for item in als_recs_batch[uid]:
+                if isinstance(item, tuple):
+                    results.append((item[0], item[1]))
+                elif isinstance(item, str):
+                    results.append((item, 0.0))
+        elif source == "als_view" and uid in als_view_recs_batch:
+            for item in als_view_recs_batch[uid]:
+                if isinstance(item, tuple):
+                    results.append((item[0], item[1]))
+                elif isinstance(item, str):
+                    results.append((item, 0.0))
+        elif source == "user_knn" and self._user_knn:
+            ctx = RecommendationContext(user_id=uid, num_recommendations=budget)
+            try:
+                knn_df = self._user_knn.recommend(ctx).collect()
+                if "item_id" in knn_df.columns:
+                    for it in knn_df["item_id"].to_list():
+                        results.append((it, 0.0))
+            except Exception:
+                pass
+        elif source == "seller" and self._seller_rec:
+            ctx = RecommendationContext(user_id=uid, num_recommendations=budget)
+            try:
+                seller_df = self._seller_rec.recommend(ctx).collect()
+                if "item_id" in seller_df.columns:
+                    for it in seller_df["item_id"].to_list():
+                        results.append((it, 0.0))
+            except Exception:
+                pass
+        elif source == "recent_cc" and pref_city and pref_cat:
+            cc_key = (pref_city, pref_cat)
+            for it in self._recent_cc.get(cc_key, []):
+                results.append((it, 0.0))
+        elif source == "segpop" and self._segpop:
+            for it in self._segpop.get_segment_items(
+                pref_city=pref_city, pref_cat=pref_cat, k=budget, user_id=uid
+            ):
+                results.append((it, 0.0))
         return results
 
     @staticmethod
